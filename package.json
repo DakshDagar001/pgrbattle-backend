@@ -2,7 +2,7 @@
   "name": "backend-server",
   "version": "1.0.0",
   "description": "Backend for PGR Battle",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
