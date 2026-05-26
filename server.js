@@ -37,53 +37,77 @@ const scheduledJobs = new Map();
    SAFE ONE SIGNAL PUSH
 ================================*/
 async function sendPushNotification(playerIds, title, message, metadata = {}) {
-  if (!playerIds.length) return { success: true, sentTo: 0 };
-
-  const response = await axios.post(
-    "https://api.onesignal.com/notifications",
-    {
-      app_id: process.env.ONESIGNAL_APP_ID,
-      include_player_ids: playerIds,
-      headings: { en: title },
-      contents: { en: message },
-      data: metadata
-    },
-    {
-      headers: {
-        Authorization: `Basic ${process.env.ONESIGNAL_API_KEY}`,
-        "Content-Type": "application/json"
-      }
+  try {
+    if (!playerIds || !playerIds.length) {
+      return { success: true, sentTo: 0 };
     }
-  );
 
-  console.log("OneSignal:", response.data);
-  return { success: true, sentTo: playerIds.length };
+    const response = await axios.post(
+      "https://api.onesignal.com/notifications",
+      {
+        app_id: process.env.ONESIGNAL_APP_ID,
+        include_player_ids: playerIds,
+        headings: { en: title },
+        contents: { en: message },
+        data: metadata
+      },
+      {
+        timeout: 8000,
+        headers: {
+          Authorization: `Basic ${process.env.ONESIGNAL_API_KEY}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    console.log("OneSignal:", response.data);
+
+    return {
+      success: true,
+      sentTo: playerIds.length
+    };
+
+  } catch (err) {
+    console.error("Push error:", err.response?.data || err.message);
+    return { success: false };
+  }
 }
 
 /* ===============================
    LOG HISTORY
 ================================*/
 async function logHistory(title, message, type, tournamentId, count) {
-  await db.collection("notificationHistory").add({
-    title,
-    message,
-    type,
-    tournamentId,
-    targetCount: count,
-    createdAt: admin.firestore.FieldValue.serverTimestamp()
-  });
+  try {
+    await db.collection("notificationHistory").add({
+      title,
+      message,
+      type,
+      tournamentId,
+      targetCount: count,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  } catch (e) {
+    console.error("History log error:", e);
+  }
 }
 
 /* ===============================
-   FIRESTORE IN LIMIT FIX (10 LIMIT)
+   ARRAY CHUNK UTILITY
+================================*/
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/* ===============================
+   FIRESTORE IN LIMIT FIX
 ================================*/
 async function getUsersPlayerIds(userIds) {
-  const chunks = [];
 
-  while (userIds.length) {
-    chunks.push(userIds.splice(0, 10));
-  }
-
+  const chunks = chunkArray(userIds, 10);
   const playerIds = [];
 
   for (const chunk of chunks) {
@@ -93,7 +117,9 @@ async function getUsersPlayerIds(userIds) {
 
     snap.forEach(doc => {
       const data = doc.data();
-      if (data.playerId) playerIds.push(data.playerId);
+      if (data.playerId) {
+        playerIds.push(data.playerId);
+      }
     });
   }
 
@@ -104,6 +130,7 @@ async function getUsersPlayerIds(userIds) {
    TOURNAMENT PARTICIPANTS
 ================================*/
 async function getTournamentParticipants(tournamentId) {
+
   const participants = await db
     .collection("tournaments")
     .doc(tournamentId)
@@ -126,7 +153,9 @@ app.get("/health", (_, res) => res.send("OK"));
    SEND NOTIFICATION
 ================================*/
 app.post("/sendNotification", async (req, res) => {
+
   try {
+
     const {
       title,
       message,
@@ -135,25 +164,39 @@ app.post("/sendNotification", async (req, res) => {
       tournamentId = null
     } = req.body;
 
-    if (!title || !message)
-      return res.status(400).json({ success: false, error: "Missing data" });
+    if (!title || !message) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing data"
+      });
+    }
 
     let playerIds = [];
 
     if (type === "all") {
+
       const users = await db.collection("users").get();
+
       users.forEach(d => {
-        if (d.data().playerId) playerIds.push(d.data().playerId);
+        if (d.data().playerId) {
+          playerIds.push(d.data().playerId);
+        }
       });
+
     }
 
     if (type === "selected") {
-      playerIds = await getUsersPlayerIds([...selectedUsers]);
+      playerIds = await getUsersPlayerIds(selectedUsers);
     }
 
     if (type === "tournament") {
-      if (!tournamentId)
-        return res.status(400).json({ success: false, error: "Tournament ID required" });
+
+      if (!tournamentId) {
+        return res.status(400).json({
+          success: false,
+          error: "Tournament ID required"
+        });
+      }
 
       playerIds = await getTournamentParticipants(tournamentId);
     }
@@ -170,17 +213,91 @@ app.post("/sendNotification", async (req, res) => {
     res.json(result);
 
   } catch (e) {
+
     console.error(e);
-    res.status(500).json({ success: false, error: "Notification failed" });
+
+    res.status(500).json({
+      success: false,
+      error: "Notification failed"
+    });
+
   }
+
+});
+
+/* ===============================
+   CHAT MESSAGE NOTIFICATION
+================================*/
+app.post("/chatNotification", async (req, res) => {
+
+  try {
+
+    const { receiverUserId, senderName, messagePreview } = req.body;
+
+    if (!receiverUserId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing receiverUserId"
+      });
+    }
+
+    const userDoc = await db.collection("users").doc(receiverUserId).get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "User not found"
+      });
+    }
+
+    const playerId = userDoc.data().playerId;
+
+    if (!playerId) {
+      return res.json({
+        success: true,
+        sentTo: 0
+      });
+    }
+
+    const title = senderName || "New Message";
+    const message = messagePreview || "You received a new message";
+
+    const result = await sendPushNotification(
+      [playerId],
+      title,
+      message,
+      { type: "chat_message" }
+    );
+
+    res.json(result);
+
+  } catch (e) {
+
+    console.error("Chat notification error:", e);
+
+    res.status(500).json({
+      success: false
+    });
+
+  }
+
 });
 
 /* ===============================
    SCHEDULE NOTIFICATION
 ================================*/
 app.post("/scheduleNotification", async (req, res) => {
+
   try {
-    const { title, message, type, selectedUsers, tournamentId, scheduleConfig } = req.body;
+
+    const {
+      title,
+      message,
+      type,
+      selectedUsers,
+      tournamentId,
+      scheduleConfig
+    } = req.body;
 
     const ref = await db.collection("scheduledNotifications").add({
       title,
@@ -195,40 +312,84 @@ app.post("/scheduleNotification", async (req, res) => {
 
     await createScheduledJob(ref.id, req.body);
 
-    res.json({ success: true, scheduleId: ref.id });
+    res.json({
+      success: true,
+      scheduleId: ref.id
+    });
 
   } catch (e) {
+
     console.error(e);
-    res.status(500).json({ success: false });
+
+    res.status(500).json({
+      success: false
+    });
+
   }
+
 });
 
 /* ===============================
    CRON CREATION
 ================================*/
 async function createScheduledJob(id, data) {
-  const { scheduleConfig } = data;
 
-  let cronExp;
+  try {
 
-  if (scheduleConfig.scheduleType === "daily") {
-    const [h, m] = scheduleConfig.time.split(":");
-    cronExp = `${m} ${h} * * *`;
+    const { scheduleConfig } = data;
+
+    if (!scheduleConfig) {
+      console.log("Missing scheduleConfig for:", id);
+      return;
+    }
+
+    let cronExp;
+
+    if (
+      scheduleConfig.scheduleType === "daily" &&
+      scheduleConfig.time
+    ) {
+
+      const [h, m] = scheduleConfig.time.split(":");
+
+      cronExp = `${m} ${h} * * *`;
+    }
+
+    if (!cronExp) {
+      console.log("Invalid cron expression for:", id);
+      return;
+    }
+
+    if (scheduledJobs.has(id)) {
+      scheduledJobs.get(id).stop();
+    }
+
+    const job = cron.schedule(cronExp, async () => {
+
+      console.log("Running scheduled job:", id);
+
+      await axios.post(
+        `${process.env.API_URL}/sendNotification`,
+        data
+      );
+
+    });
+
+    scheduledJobs.set(id, job);
+
+  } catch (e) {
+
+    console.error("Scheduled job error:", e);
+
   }
 
-  const job = cron.schedule(cronExp, async () => {
-    console.log("Running scheduled job:", id);
-
-    await axios.post(`${process.env.API_URL}/sendNotification`, data);
-  });
-
-  scheduledJobs.set(id, job);
 }
 
 /* ===============================
    LOAD JOBS ON START
 ================================*/
 async function loadScheduledJobs() {
+
   const snap = await db.collection("scheduledNotifications")
     .where("isActive", "==", true)
     .get();
@@ -244,10 +405,12 @@ async function loadScheduledJobs() {
    TOURNAMENT REMINDERS
 ================================*/
 async function checkTournamentReminders() {
+
   const now = new Date();
   const offsets = [60, 30, 5];
 
   for (const offset of offsets) {
+
     const future = new Date(now.getTime() + offset * 60000);
 
     const snap = await db.collection("tournaments")
@@ -256,6 +419,7 @@ async function checkTournamentReminders() {
       .get();
 
     for (const doc of snap.docs) {
+
       const data = doc.data();
 
       if (data.reminderSent?.includes(offset)) continue;
@@ -272,6 +436,7 @@ async function checkTournamentReminders() {
       await db.collection("tournaments").doc(doc.id).update({
         reminderSent: admin.firestore.FieldValue.arrayUnion(offset)
       });
+
     }
   }
 }
@@ -280,15 +445,21 @@ async function checkTournamentReminders() {
    START SERVER
 ================================*/
 async function startServer() {
+
   await loadScheduledJobs();
 
   cron.schedule("*/5 * * * *", checkTournamentReminders);
 
-  const PORT = process.env.PORT || 5230;
-  app.listen(PORT, () => console.log("Server running on", PORT));
+  const PORT = process.env.PORT || 8080;
+
+  app.listen(PORT, () =>
+    console.log("Server running on", PORT)
+  );
 }
 
 startServer();
 
 /* =============================== */
-app.get("/", (_, res) => res.send("PGR Battle API Running 🚀"));
+app.get("/", (_, res) =>
+  res.send("PGR Battle API Running 🚀")
+);

@@ -1,7 +1,7 @@
 {
-  "name": "notification-server",
+  "name": "backend-server",
   "version": "1.0.0",
-  "description": "Notification backend for PGR Battle",
+  "description": "Backend for PGR Battle",
   "main": "index.js",
   "scripts": {
     "start": "node server.js"
