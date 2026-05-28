@@ -1,3 +1,6 @@
 node_modules
 .env
 serviceAccount.json
+config/gmail-oauth.json
+token.json
+gmail-credentials.json

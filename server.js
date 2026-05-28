@@ -22,15 +22,46 @@ app.use((req, res, next) => {
 /* ===============================
    FIREBASE INIT
 ================================*/
-const serviceAccount = JSON.parse(
-    process.env.FIREBASE_SERVICE_ACCOUNT
-);
+let serviceAccount;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    console.log('Firebase: Using env FIREBASE_SERVICE_ACCOUNT');
+  } else {
+    serviceAccount = require('./serviceAccount.json');
+    console.log('Firebase: Using local serviceAccount.json');
+  }
+} catch (err) {
+  console.error('Firebase init failed:', err.message);
+  process.exit(1);
+}
 
 admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: process.env.FIREBASE_DATABASE_URL || 'https://pgr-battle-default-rtdb.firebaseio.com'
 });
 
 const db = admin.firestore();
+const rtdb = admin.database();
+
+/* ===============================
+   DEPOSIT SYSTEM INIT
+================================*/
+const { initGmail } = require('./services/gmailService');
+const { initVerifier } = require('./services/depositVerifier');
+const depositRoutes = require('./routes/depositRoutes');
+
+// Initialise Gmail API and deposit verifier
+try {
+  initGmail();
+  console.log('Gmail service initialised');
+} catch (err) {
+  console.error('Gmail init failed (deposits will not auto-verify):', err.message);
+}
+initVerifier(sendPushNotification);
+
+// Mount deposit routes
+app.use('/api/deposit', depositRoutes);
 
 /* ===============================
    GLOBAL JOB STORAGE
@@ -445,6 +476,8 @@ async function checkTournamentReminders() {
   }
 }
 
+/* Old gmail stub removed – replaced by services/gmailService.js */
+
 /* ===============================
    START SERVER
 ================================*/
@@ -456,9 +489,15 @@ async function startServer() {
 
   const PORT = process.env.PORT || 8080;
 
-  app.listen(PORT, () =>
+  const server = app.listen(PORT, () =>
     console.log("Server running on", PORT)
   );
+
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log('SIGTERM received – shutting down gracefully');
+    server.close(() => process.exit(0));
+  });
 }
 
 startServer();

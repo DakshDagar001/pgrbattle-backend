@@ -11,11 +11,14 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@google-cloud/local-auth": "^3.0.1",
     "axios": "^1.13.5",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "firebase-admin": "^13.6.1",
-    "node-cron": "^3.0.3"
+    "googleapis": "^172.0.0",
+    "node-cron": "^3.0.3",
+    "readline-sync": "^1.4.10"
   }
 }
