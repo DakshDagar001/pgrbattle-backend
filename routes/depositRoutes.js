@@ -92,9 +92,13 @@ router.post('/create', verifyAuth, async (req, res) => {
       });
     }
 
-    // Generate request ID
-    const last6 = userId.slice(-6);
-    const requestId = `DEP_${last6}_${Date.now()}`;
+    // Generate request ID: PGR + 12 alphanumeric characters
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let randomPart = '';
+    for (let i = 0; i < 12; i++) {
+      randomPart += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    const requestId = `PGR${randomPart}`;
 
     const now = Date.now();
 
