@@ -81,7 +81,7 @@ async function sendPushNotification(playerIds, title, message, metadata = {}) {
       "https://api.onesignal.com/notifications",
       {
         app_id: process.env.ONESIGNAL_APP_ID,
-        include_player_ids: playerIds,
+        include_subscription_ids: playerIds,
         headings: { en: title },
         contents: { en: message },
         data: metadata
