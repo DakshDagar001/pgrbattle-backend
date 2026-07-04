@@ -69,12 +69,137 @@ app.use('/api/deposit', depositRoutes);
 const scheduledJobs = new Map();
 
 /* ===============================
-   SAFE ONE SIGNAL PUSH
+   NOTIFICATION HELPERS
 ================================*/
+function normalizeErrorMessage(value) {
+  if (!value) return null;
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(normalizeErrorMessage).filter(Boolean).join("; ");
+  if (typeof value === "object") {
+    if (value.message) return normalizeErrorMessage(value.message);
+    return Object.entries(value)
+      .map(([key, val]) => `${key}: ${normalizeErrorMessage(val) || JSON.stringify(val)}`)
+      .join("; ");
+  }
+  return String(value);
+}
+
+function oneSignalResponseError(data) {
+  if (!data) return "Empty OneSignal response";
+
+  const details = [];
+  const errors = normalizeErrorMessage(data.errors);
+  const warnings = normalizeErrorMessage(data.warnings);
+  const invalidPlayerIds = normalizeErrorMessage(data.invalid_player_ids);
+  const invalidSubscriptionIds = normalizeErrorMessage(data.invalid_subscription_ids);
+
+  if (errors) details.push(errors);
+  if (warnings) details.push(`Warnings: ${warnings}`);
+  if (invalidPlayerIds) details.push(`Invalid player IDs: ${invalidPlayerIds}`);
+  if (invalidSubscriptionIds) details.push(`Invalid subscription IDs: ${invalidSubscriptionIds}`);
+
+  return details.join("; ");
+}
+
+function formatTimestamp(value) {
+  if (!value) return null;
+  if (value.toDate) return value.toDate().toISOString();
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+}
+
+function weekdayToCronValue(weekday) {
+  const days = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6
+  };
+  return days[String(weekday).toLowerCase()];
+}
+
+async function collectFcmTokens(collectionName) {
+  const snap = await db.collection(collectionName).get();
+  const tokens = [];
+
+  snap.forEach(doc => {
+    const token = doc.data().fcmToken;
+    if (typeof token === "string" && token.trim()) {
+      tokens.push(token.trim());
+    }
+  });
+
+  return tokens;
+}
+
+async function sendFcmNotification(tokens, title, body, data = {}) {
+  const uniqueTokens = [...new Set((tokens || []).filter(Boolean))];
+
+  if (!uniqueTokens.length) {
+    return {
+      success: false,
+      sentTo: 0,
+      error: "No FCM tokens found for the requested recipients"
+    };
+  }
+
+  let successCount = 0;
+  let failureCount = 0;
+  const errors = [];
+
+  for (const tokenChunk of chunkArray(uniqueTokens, 500)) {
+    const response = await admin.messaging().sendEachForMulticast({
+      tokens: tokenChunk,
+      notification: { title, body },
+      data: Object.fromEntries(
+        Object.entries(data).map(([key, value]) => [key, String(value ?? "")])
+      ),
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "pgr_battle_notifications"
+        }
+      }
+    });
+
+    successCount += response.successCount;
+    failureCount += response.failureCount;
+
+    response.responses.forEach((item, index) => {
+      if (!item.success) {
+        errors.push(`${tokenChunk[index]}: ${item.error?.message || "Unknown FCM error"}`);
+      }
+    });
+  }
+
+  return {
+    success: successCount > 0,
+    sentTo: successCount,
+    failed: failureCount,
+    error: successCount > 0 ? null : (errors[0] || "FCM failed for every recipient"),
+    errors: errors.slice(0, 10)
+  };
+}
+
 async function sendPushNotification(playerIds, title, message, metadata = {}) {
   try {
     if (!playerIds || !playerIds.length) {
-      return { success: true, sentTo: 0 };
+      return {
+        success: false,
+        sentTo: 0,
+        error: "No OneSignal subscription IDs found for the selected recipients"
+      };
+    }
+
+    if (!process.env.ONESIGNAL_APP_ID) {
+      return { success: false, sentTo: 0, error: "ONESIGNAL_APP_ID is not configured" };
+    }
+
+    if (!process.env.ONESIGNAL_API_KEY) {
+      return { success: false, sentTo: 0, error: "ONESIGNAL_API_KEY is not configured" };
     }
 
     const response = await axios.post(
@@ -97,14 +222,32 @@ async function sendPushNotification(playerIds, title, message, metadata = {}) {
 
     console.log("OneSignal:", response.data);
 
+    const providerError = oneSignalResponseError(response.data);
+    const recipients = Number(response.data?.recipients ?? 0);
+
+    if (providerError || recipients === 0) {
+      return {
+        success: false,
+        sentTo: recipients,
+        error: providerError || "OneSignal accepted the request but delivered it to 0 recipients"
+      };
+    }
+
     return {
       success: true,
-      sentTo: playerIds.length
+      sentTo: recipients
     };
 
   } catch (err) {
+    const providerError = normalizeErrorMessage(err.response?.data?.errors)
+      || normalizeErrorMessage(err.response?.data)
+      || err.message;
     console.error("Push error:", err.response?.data || err.message);
-    return { success: false };
+    return {
+      success: false,
+      sentTo: 0,
+      error: providerError || "Push notification failed"
+    };
   }
 }
 
@@ -179,6 +322,50 @@ async function getTournamentParticipants(tournamentId) {
   return await getUsersPlayerIds(userIds);
 }
 
+async function resolvePlayerIdsForRequest({ type, selectedUsers = [], tournamentId = null }) {
+  let playerIds = [];
+
+  if (type === "all") {
+    const users = await db.collection("users").get();
+
+    users.forEach(d => {
+      if (d.data().playerId) {
+        playerIds.push(d.data().playerId);
+      }
+    });
+  } else if (type === "selected") {
+    playerIds = await getUsersPlayerIds(selectedUsers || []);
+  } else if (type === "tournament") {
+    if (!tournamentId) {
+      throw Object.assign(new Error("Tournament ID required"), { statusCode: 400 });
+    }
+    playerIds = await getTournamentParticipants(tournamentId);
+  } else {
+    throw Object.assign(new Error(`Invalid notification type: ${type}`), { statusCode: 400 });
+  }
+
+  return [...new Set(playerIds.filter(Boolean))];
+}
+
+async function dispatchNotification(data) {
+  const playerIds = await resolvePlayerIdsForRequest(data);
+
+  if (!playerIds.length) {
+    return {
+      success: false,
+      sentTo: 0,
+      error: "No target users with valid OneSignal subscription IDs were found"
+    };
+  }
+
+  return await sendPushNotification(
+    playerIds,
+    data.title,
+    data.message,
+    { type: data.type, tournamentId: data.tournamentId || "" }
+  );
+}
+
 /* ===============================
    HEALTH ENDPOINT
 ================================*/
@@ -206,54 +393,25 @@ app.post("/sendNotification", async (req, res) => {
       });
     }
 
-    let playerIds = [];
-
-    if (type === "all") {
-
-      const users = await db.collection("users").get();
-
-      users.forEach(d => {
-        if (d.data().playerId) {
-          playerIds.push(d.data().playerId);
-        }
-      });
-
-    }
-
-    if (type === "selected") {
-      playerIds = await getUsersPlayerIds(selectedUsers);
-    }
-
-    if (type === "tournament") {
-
-      if (!tournamentId) {
-        return res.status(400).json({
-          success: false,
-          error: "Tournament ID required"
-        });
-      }
-
-      playerIds = await getTournamentParticipants(tournamentId);
-    }
-
-    const result = await sendPushNotification(
-      playerIds,
+    const result = await dispatchNotification({
       title,
       message,
-      { type, tournamentId }
-    );
+      type,
+      selectedUsers,
+      tournamentId
+    });
 
     await logHistory(title, message, type, tournamentId, result.sentTo);
 
-    res.json(result);
+    res.status(result.success ? 200 : 400).json(result);
 
   } catch (e) {
 
     console.error(e);
 
-    res.status(500).json({
+    res.status(e.statusCode || 500).json({
       success: false,
-      error: "Notification failed"
+      error: e.message || "Notification failed"
     });
 
   }
@@ -289,8 +447,9 @@ app.post("/chatNotification", async (req, res) => {
 
     if (!playerId) {
       return res.json({
-        success: true,
-        sentTo: 0
+        success: false,
+        sentTo: 0,
+        error: "Receiver user does not have a OneSignal subscription ID"
       });
     }
 
@@ -304,18 +463,54 @@ app.post("/chatNotification", async (req, res) => {
       { type: "chat_message" }
     );
 
-    res.json(result);
+    res.status(result.success ? 200 : 400).json(result);
 
   } catch (e) {
 
     console.error("Chat notification error:", e);
 
     res.status(500).json({
-      success: false
+      success: false,
+      error: e.message || "Chat notification failed"
     });
 
   }
 
+});
+
+/* ===============================
+   SUPPORT STAFF CHAT NOTIFICATION
+================================*/
+app.post("/supportStaffNotification", async (req, res) => {
+  try {
+    const { senderName, messagePreview, chatId } = req.body;
+    const title = senderName || "New support message";
+    const body = messagePreview || "A player sent a support message";
+
+    const [adminTokens, organizerTokens] = await Promise.all([
+      collectFcmTokens("admin_users"),
+      collectFcmTokens("organizer_users")
+    ]);
+
+    const result = await sendFcmNotification(
+      [...adminTokens, ...organizerTokens],
+      title,
+      body,
+      {
+        type: "support_chat",
+        category: "support",
+        chatId: chatId || ""
+      }
+    );
+
+    res.status(result.success ? 200 : 400).json(result);
+  } catch (e) {
+    console.error("Support staff notification error:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message || "Support staff notification failed"
+    });
+  }
 });
 
 /* ===============================
@@ -334,12 +529,32 @@ app.post("/scheduleNotification", async (req, res) => {
       scheduleConfig
     } = req.body;
 
+    if (!title || !message) {
+      return res.status(400).json({
+        success: false,
+        error: "Title and message are required"
+      });
+    }
+
+    if (!scheduleConfig || !scheduleConfig.scheduleType) {
+      return res.status(400).json({
+        success: false,
+        error: "scheduleConfig.scheduleType is required"
+      });
+    }
+
+    await resolvePlayerIdsForRequest({
+      type,
+      selectedUsers: selectedUsers || [],
+      tournamentId: tournamentId || null
+    });
+
     const ref = await db.collection("scheduledNotifications").add({
       title,
       message,
       type,
-      selectedUsers,
-      tournamentId,
+      selectedUsers: selectedUsers || [],
+      tournamentId: tournamentId || null,
       scheduleConfig,
       isActive: true,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
@@ -356,12 +571,102 @@ app.post("/scheduleNotification", async (req, res) => {
 
     console.error(e);
 
-    res.status(500).json({
-      success: false
+    res.status(e.statusCode || 500).json({
+      success: false,
+      error: e.message || "Failed to schedule notification"
     });
 
   }
 
+});
+
+app.get("/scheduledNotifications", async (_, res) => {
+  try {
+    const snap = await db.collection("scheduledNotifications")
+      .orderBy("createdAt", "desc")
+      .get();
+
+    const schedules = snap.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        title: data.title || "",
+        message: data.message || "",
+        type: data.type || "all",
+        tournamentId: data.tournamentId || null,
+        selectedUsers: data.selectedUsers || [],
+        scheduleConfig: data.scheduleConfig || {},
+        isActive: data.isActive !== false,
+        createdAt: formatTimestamp(data.createdAt)
+      };
+    });
+
+    res.json({ success: true, schedules });
+  } catch (e) {
+    console.error("Scheduled notifications fetch error:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message || "Failed to load scheduled notifications"
+    });
+  }
+});
+
+app.delete("/scheduledNotification/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!id) {
+      return res.status(400).json({ success: false, error: "Schedule ID required" });
+    }
+
+    if (scheduledJobs.has(id)) {
+      scheduledJobs.get(id).stop();
+      scheduledJobs.delete(id);
+    }
+
+    await db.collection("scheduledNotifications").doc(id).set({
+      isActive: false,
+      deletedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Scheduled notification delete error:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message || "Failed to delete scheduled notification"
+    });
+  }
+});
+
+app.get("/notificationHistory", async (_, res) => {
+  try {
+    const snap = await db.collection("notificationHistory")
+      .orderBy("createdAt", "desc")
+      .limit(200)
+      .get();
+
+    const history = snap.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        title: data.title || "",
+        message: data.message || "",
+        type: data.type || "all",
+        tournamentId: data.tournamentId || null,
+        targetCount: Number(data.targetCount || 0),
+        createdAt: formatTimestamp(data.createdAt)
+      };
+    });
+
+    res.json({ success: true, history });
+  } catch (e) {
+    console.error("Notification history fetch error:", e);
+    res.status(500).json({
+      success: false,
+      error: e.message || "Failed to load notification history"
+    });
+  }
 });
 
 /* ===============================
