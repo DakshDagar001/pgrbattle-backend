@@ -101,6 +101,16 @@ function oneSignalResponseError(data) {
   return details.join("; ");
 }
 
+function getOneSignalAuthorizationHeader(apiKey) {
+  const trimmedKey = String(apiKey || "").trim();
+  if (/^(Basic|Key|Bearer)\s+/i.test(trimmedKey)) {
+    return trimmedKey;
+  }
+  return trimmedKey.startsWith("os_v2_")
+    ? `Key ${trimmedKey}`
+    : `Basic ${trimmedKey}`;
+}
+
 function formatTimestamp(value) {
   if (!value) return null;
   if (value.toDate) return value.toDate().toISOString();
@@ -119,6 +129,13 @@ function weekdayToCronValue(weekday) {
     saturday: 6
   };
   return days[String(weekday).toLowerCase()];
+}
+
+function parseScheduleDateTime(dateTime) {
+  const value = String(dateTime || "").trim();
+  if (!value) return new Date(NaN);
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(value)) return new Date(value);
+  return new Date(`${value}${process.env.NOTIFICATION_UTC_OFFSET || "+05:30"}`);
 }
 
 async function collectFcmTokens(collectionName) {
@@ -214,7 +231,7 @@ async function sendPushNotification(playerIds, title, message, metadata = {}) {
       {
         timeout: 8000,
         headers: {
-          Authorization: `Basic ${process.env.ONESIGNAL_API_KEY}`,
+          Authorization: getOneSignalAuthorizationHeader(process.env.ONESIGNAL_API_KEY),
           "Content-Type": "application/json"
         }
       }
@@ -315,7 +332,9 @@ async function getTournamentParticipants(tournamentId) {
     .collection("participants")
     .get();
 
-  const userIds = participants.docs.map(d => d.id);
+  const userIds = participants.docs
+    .map(d => d.get("odcUid") || d.id)
+    .filter(Boolean);
 
   if (!userIds.length) return [];
 
@@ -446,7 +465,7 @@ app.post("/chatNotification", async (req, res) => {
     const playerId = userDoc.data().playerId;
 
     if (!playerId) {
-      return res.json({
+      return res.status(400).json({
         success: false,
         sentTo: 0,
         error: "Receiver user does not have a OneSignal subscription ID"
@@ -517,6 +536,7 @@ app.post("/supportStaffNotification", async (req, res) => {
    SCHEDULE NOTIFICATION
 ================================*/
 app.post("/scheduleNotification", async (req, res) => {
+  let ref = null;
 
   try {
 
@@ -549,7 +569,7 @@ app.post("/scheduleNotification", async (req, res) => {
       tournamentId: tournamentId || null
     });
 
-    const ref = await db.collection("scheduledNotifications").add({
+    ref = await db.collection("scheduledNotifications").add({
       title,
       message,
       type,
@@ -560,7 +580,14 @@ app.post("/scheduleNotification", async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    await createScheduledJob(ref.id, req.body);
+    await createScheduledJob(ref.id, {
+      title,
+      message,
+      type,
+      selectedUsers: selectedUsers || [],
+      tournamentId: tournamentId || null,
+      scheduleConfig
+    });
 
     res.json({
       success: true,
@@ -570,6 +597,16 @@ app.post("/scheduleNotification", async (req, res) => {
   } catch (e) {
 
     console.error(e);
+
+    if (ref) {
+      await ref.set({
+        isActive: false,
+        lastError: e.message || "Failed to create scheduled job",
+        deletedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true }).catch(err => {
+        console.error("Failed to mark invalid schedule inactive:", err.message);
+      });
+    }
 
     res.status(e.statusCode || 500).json({
       success: false,
@@ -619,8 +656,9 @@ app.delete("/scheduledNotification/:id", async (req, res) => {
       return res.status(400).json({ success: false, error: "Schedule ID required" });
     }
 
-    if (scheduledJobs.has(id)) {
-      scheduledJobs.get(id).stop();
+    const scheduledJob = scheduledJobs.get(id);
+    if (scheduledJob) {
+      scheduledJob.stop();
       scheduledJobs.delete(id);
     }
 
@@ -679,47 +717,110 @@ async function createScheduledJob(id, data) {
     const { scheduleConfig } = data;
 
     if (!scheduleConfig) {
-      console.log("Missing scheduleConfig for:", id);
-      return;
+      throw Object.assign(new Error("Missing scheduleConfig"), { statusCode: 400 });
     }
 
     let cronExp;
+    let timeoutDelayMs;
+    const timezone = process.env.NOTIFICATION_TIMEZONE || "Asia/Kolkata";
+    const scheduleType = scheduleConfig.scheduleType;
 
-    if (
-      scheduleConfig.scheduleType === "daily" &&
-      scheduleConfig.time
-    ) {
+    if (scheduleType === "oneTime" && scheduleConfig.dateTime) {
+      const runAt = parseScheduleDateTime(scheduleConfig.dateTime);
+      if (Number.isNaN(runAt.getTime())) {
+        throw Object.assign(new Error("Invalid one-time schedule dateTime"), { statusCode: 400 });
+      }
 
+      timeoutDelayMs = runAt.getTime() - Date.now();
+      if (timeoutDelayMs <= 0) {
+        throw Object.assign(new Error("Schedule date/time must be in the future"), { statusCode: 400 });
+      }
+      if (timeoutDelayMs > 2147483647) {
+        throw Object.assign(new Error("One-time schedule must be within 24 days"), { statusCode: 400 });
+      }
+    }
+
+    if (scheduleType === "daily" && scheduleConfig.time) {
       const [h, m] = scheduleConfig.time.split(":");
+      if (h === undefined || m === undefined) {
+        throw Object.assign(new Error("Daily schedule time must be HH:mm"), { statusCode: 400 });
+      }
 
       cronExp = `${m} ${h} * * *`;
     }
 
-    if (!cronExp) {
-      console.log("Invalid cron expression for:", id);
-      return;
+    if (scheduleType === "weekly" && scheduleConfig.time) {
+      const [h, m] = scheduleConfig.time.split(":");
+      const days = (scheduleConfig.weekdays || [])
+        .map(weekdayToCronValue)
+        .filter(value => value !== undefined);
+
+      if (h === undefined || m === undefined) {
+        throw Object.assign(new Error("Weekly schedule time must be HH:mm"), { statusCode: 400 });
+      }
+      if (!days.length) {
+        throw Object.assign(new Error("Weekly schedule requires at least one valid weekday"), { statusCode: 400 });
+      }
+
+      cronExp = `${m} ${h} * * ${days.join(",")}`;
+    }
+
+    if (!cronExp && timeoutDelayMs === undefined) {
+      throw Object.assign(new Error(`Unsupported schedule configuration: ${JSON.stringify(scheduleConfig)}`), { statusCode: 400 });
     }
 
     if (scheduledJobs.has(id)) {
       scheduledJobs.get(id).stop();
     }
 
-    const job = cron.schedule(cronExp, async () => {
-
+    const runScheduledNotification = async () => {
       console.log("Running scheduled job:", id);
+      const doc = await db.collection("scheduledNotifications").doc(id).get();
+      if (!doc.exists || doc.data().isActive === false) {
+        const existingJob = scheduledJobs.get(id);
+        if (existingJob) existingJob.stop();
+        scheduledJobs.delete(id);
+        return;
+      }
 
-      await axios.post(
-        `${process.env.API_URL}/sendNotification`,
-        data
-      );
+      const result = await dispatchNotification(data);
+      await logHistory(data.title, data.message, data.type, data.tournamentId || null, result.sentTo || 0);
 
-    });
+      if (!result.success) {
+        await db.collection("scheduledNotifications").doc(id).set({
+          lastError: result.error || "Scheduled notification failed",
+          lastRunAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        console.error("Scheduled notification failed:", id, result.error);
+      } else {
+        await db.collection("scheduledNotifications").doc(id).set({
+          lastError: null,
+          lastRunAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+      }
+
+      if (scheduleType === "oneTime") {
+        await db.collection("scheduledNotifications").doc(id).set({
+          isActive: false,
+          completedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        scheduledJobs.delete(id);
+      }
+    };
+
+    const job = timeoutDelayMs !== undefined
+      ? {
+          stop: () => clearTimeout(job.timeout),
+          timeout: setTimeout(runScheduledNotification, timeoutDelayMs)
+        }
+      : cron.schedule(cronExp, runScheduledNotification, { timezone });
 
     scheduledJobs.set(id, job);
 
   } catch (e) {
 
     console.error("Scheduled job error:", e);
+    throw e;
 
   }
 
