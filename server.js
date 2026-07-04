@@ -20,6 +20,18 @@ app.use((req, res, next) => {
 });
 
 /* ===============================
+   ONESIGNAL ENV VALIDATION
+================================*/
+if (!process.env.ONESIGNAL_APP_ID) {
+  console.error("⚠️  WARNING: ONESIGNAL_APP_ID environment variable is NOT set. Push notifications will fail.");
+}
+if (!process.env.ONESIGNAL_API_KEY) {
+  console.error("⚠️  WARNING: ONESIGNAL_API_KEY environment variable is NOT set. Push notifications will fail.");
+} else {
+  console.log("OneSignal: API key loaded (" + process.env.ONESIGNAL_API_KEY.substring(0, 12) + "...)");
+}
+
+/* ===============================
    FIREBASE INIT
 ================================*/
 let serviceAccount;
