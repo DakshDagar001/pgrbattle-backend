@@ -808,12 +808,14 @@ async function createScheduledJob(id, data) {
       }
     };
 
+    let timeoutHandle = null;
     const job = timeoutDelayMs !== undefined
-      ? {
-          stop: () => clearTimeout(job.timeout),
-          timeout: setTimeout(runScheduledNotification, timeoutDelayMs)
-        }
+      ? { stop: () => clearTimeout(timeoutHandle) }
       : cron.schedule(cronExp, runScheduledNotification, { timezone });
+
+    if (timeoutDelayMs !== undefined) {
+      timeoutHandle = setTimeout(runScheduledNotification, timeoutDelayMs);
+    }
 
     scheduledJobs.set(id, job);
 
@@ -829,17 +831,41 @@ async function createScheduledJob(id, data) {
 /* ===============================
    LOAD JOBS ON START
 ================================*/
+async function disableInvalidScheduledJob(id, reason) {
+  await db.collection("scheduledNotifications").doc(id).set({
+    isActive: false,
+    lastError: reason,
+    disabledAt: admin.firestore.FieldValue.serverTimestamp()
+  }, { merge: true });
+}
+
 async function loadScheduledJobs() {
 
   const snap = await db.collection("scheduledNotifications")
     .where("isActive", "==", true)
     .get();
 
+  let loadedCount = 0;
+  let skippedCount = 0;
+
   for (const doc of snap.docs) {
-    await createScheduledJob(doc.id, doc.data());
+    try {
+      await createScheduledJob(doc.id, doc.data());
+      loadedCount += 1;
+    } catch (e) {
+      skippedCount += 1;
+      const message = e.message || "Invalid scheduled notification";
+      console.error(`Skipping scheduled job ${doc.id}:`, message);
+
+      try {
+        await disableInvalidScheduledJob(doc.id, message);
+      } catch (updateError) {
+        console.error(`Failed to disable invalid scheduled job ${doc.id}:`, updateError);
+      }
+    }
   }
 
-  console.log("Loaded schedules:", snap.size);
+  console.log("Loaded schedules:", loadedCount, "Skipped invalid schedules:", skippedCount);
 }
 
 /* ===============================
@@ -889,7 +915,11 @@ async function checkTournamentReminders() {
 ================================*/
 async function startServer() {
 
-  await loadScheduledJobs();
+  try {
+    await loadScheduledJobs();
+  } catch (e) {
+    console.error("Scheduled jobs could not be loaded on startup:", e);
+  }
 
   cron.schedule("*/5 * * * *", checkTournamentReminders);
 
