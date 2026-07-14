@@ -74,7 +74,7 @@ This repository powers the server-side architecture of the platform including:
 * Firestore
 * Firebase Realtime Database
 * Gmail API
-* Railway Deployment
+* Render Deployment
 * Google OAuth2
 * Cron Jobs
 * REST APIs
@@ -88,13 +88,19 @@ Example configuration:
 ```env
 PORT=8080
 
-FIREBASE_SERVICE_ACCOUNT=
-GMAIL_OAUTH_CREDENTIALS=
-GMAIL_OAUTH_TOKEN=
+FIREBASE_PROJECT_ID=pgr-battle
+FIREBASE_PRIVATE_KEY_ID=
+FIREBASE_PRIVATE_KEY=
+FIREBASE_CLIENT_EMAIL=
+FIREBASE_CLIENT_ID=
+FIREBASE_DATABASE_URL=
+
+GMAIL_CLIENT_ID=
+GMAIL_CLIENT_SECRET=
+GMAIL_REDIRECT_URI=
+GMAIL_REFRESH_TOKEN=
 
 JWT_SECRET=
-
-RAILWAY_PUBLIC_DOMAIN=
 ```
 
 ---
@@ -103,7 +109,7 @@ RAILWAY_PUBLIC_DOMAIN=
 
 Backend is optimized for:
 
-* Railway
+* Render
 * VPS Deployments
 * Docker-based environments
 
@@ -178,7 +184,7 @@ npm start
 
 Backend currently supports:
 
-* Production Railway deployment
+* Production Render deployment
 * Gmail verification services
 * Real-time infrastructure
 * Notification systems

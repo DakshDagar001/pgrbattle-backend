@@ -4,9 +4,7 @@
  * Initialises a Gmail API client using OAuth2 credentials and provides
  * a function to fetch payment-related emails from FamPay.
  *
- * Credential sources (in priority order):
- *   1. Environment variables GMAIL_OAUTH_CREDENTIALS / GMAIL_OAUTH_TOKEN
- *   2. Local files config/gmail-oauth.json / token.json
+ * Credential sources: Environment variables GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REDIRECT_URI, GMAIL_REFRESH_TOKEN
  */
 
 const fs = require('fs');
@@ -33,66 +31,29 @@ const TOKEN_PATH = path.join(__dirname, '..', 'token.json');
 function initGmail() {
   if (gmail) return; // already initialised
 
-  // 1. Load credentials
-  let credentials;
-  if (process.env.GMAIL_OAUTH_CREDENTIALS) {
-    try {
-      credentials = JSON.parse(process.env.GMAIL_OAUTH_CREDENTIALS);
-      console.log('[Gmail] Loaded credentials from env GMAIL_OAUTH_CREDENTIALS');
-    } catch (e) {
-      console.error('[Gmail] Failed to parse GMAIL_OAUTH_CREDENTIALS env var:', e.message);
-      throw new Error('Invalid GMAIL_OAUTH_CREDENTIALS JSON');
-    }
-  } else {
-    if (!fs.existsSync(CREDENTIALS_PATH)) {
-      throw new Error(`Gmail credentials file not found at ${CREDENTIALS_PATH}`);
-    }
-    credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
-    console.log('[Gmail] Loaded credentials from', CREDENTIALS_PATH);
+  const clientId = process.env.GMAIL_CLIENT_ID;
+  const clientSecret = process.env.GMAIL_CLIENT_SECRET;
+  const redirectUri = process.env.GMAIL_REDIRECT_URI;
+  const refreshToken = process.env.GMAIL_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret || !redirectUri || !refreshToken) {
+    throw new Error('Missing one or more required Gmail environment variables.');
   }
 
-  const { client_secret, client_id, redirect_uris } =
-    credentials.installed || credentials.web;
-
-  oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-
-  // 2. Load token
-  let token;
-  if (process.env.GMAIL_OAUTH_TOKEN) {
-    try {
-      token = JSON.parse(process.env.GMAIL_OAUTH_TOKEN);
-      console.log('[Gmail] Loaded token from env GMAIL_OAUTH_TOKEN');
-    } catch (e) {
-      console.error('[Gmail] Failed to parse GMAIL_OAUTH_TOKEN env var:', e.message);
-      throw new Error('Invalid GMAIL_OAUTH_TOKEN JSON');
-    }
-  } else {
-    if (!fs.existsSync(TOKEN_PATH)) {
-      throw new Error(`Gmail token file not found at ${TOKEN_PATH}`);
-    }
-    token = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
-    console.log('[Gmail] Loaded token from', TOKEN_PATH);
-  }
-
-  oauth2Client.setCredentials(token);
-
-  // 3. Listen for automatic token refreshes and persist updated tokens
-  oauth2Client.on('tokens', (newTokens) => {
-    console.log('[Gmail] Token refreshed, persisting new tokens');
-    try {
-      // Merge with existing token so we keep the refresh_token
-      const current = fs.existsSync(TOKEN_PATH)
-        ? JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'))
-        : {};
-      const merged = { ...current, ...newTokens };
-      fs.writeFileSync(TOKEN_PATH, JSON.stringify(merged, null, 2), 'utf8');
-      console.log('[Gmail] Updated token saved to', TOKEN_PATH);
-    } catch (e) {
-      console.error('[Gmail] Failed to save refreshed token:', e.message);
-    }
+  oauth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  
+  // Set credentials from environment
+  oauth2Client.setCredentials({
+    refresh_token: refreshToken
   });
 
-  // 4. Create Gmail client
+  // Listen for automatic token refreshes
+  oauth2Client.on('tokens', (newTokens) => {
+    console.log('[Gmail] Token refreshed successfully');
+    // Note: In a robust setup, you might want to save the new refresh_token back to your DB/Env if it changes.
+  });
+
+  // Create Gmail client
   gmail = google.gmail({ version: 'v1', auth: oauth2Client });
   console.log('[Gmail] Service initialised successfully');
 }
