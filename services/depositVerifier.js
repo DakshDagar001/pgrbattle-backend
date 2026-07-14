@@ -9,7 +9,7 @@
  *   - Firebase Admin (RTDB + Firestore)
  *   - gmailService.fetchLatestPaymentEmails()
  *   - paymentParser.parsePaymentEmail()
- *   - sendPushNotification() (injected via initVerifier)
+ *   - notificationEngine.notifyUser() (injected via initVerifier)
  */
 
 const admin = require('firebase-admin');
@@ -21,8 +21,8 @@ const { parsePaymentEmail } = require('./paymentParser');
 /** Map<requestId, { intervalId, userId, amount, utr, iteration, startedAt }> */
 const activeJobs = new Map();
 
-/** Reference to the push notification function (injected at startup). */
-let pushFn = null;
+/** Reference to the notifyUser function (injected at startup). */
+let notifyUserFn = null;
 
 // ── Init ───────────────────────────────────────────────────────────────────────
 
@@ -30,10 +30,10 @@ let pushFn = null;
  * Store a reference to the push notification function so the verifier
  * can notify users when deposits are verified or expire.
  *
- * @param {Function} sendPushNotificationFn
+ * @param {Function} notifyUser
  */
-function initVerifier(sendPushNotificationFn) {
-  pushFn = sendPushNotificationFn;
+function initVerifier(notifyUser) {
+  notifyUserFn = notifyUser;
   console.log('[Verifier] Initialised');
 }
 
@@ -48,31 +48,15 @@ function firestore() {
 }
 
 /**
- * Fetch OneSignal playerIds for a single user from Firestore.
- */
-async function getPlayerIds(userId) {
-  try {
-    const doc = await firestore().collection('users').doc(userId).get();
-    if (doc.exists && doc.data().playerId) {
-      return [doc.data().playerId];
-    }
-  } catch (e) {
-    console.error('[Verifier] Failed to get playerId for', userId, e.message);
-  }
-  return [];
-}
-
-/**
- * Send a push notification to a user (no-op if pushFn is not set).
+ * Send a push notification to a user (no-op if notifyUserFn is not set).
  */
 async function notify(userId, title, message, data = {}) {
-  if (!pushFn) {
-    console.warn('[Verifier] pushFn not set – skipping notification');
+  if (!notifyUserFn) {
+    console.warn('[Verifier] notifyUserFn not set – skipping notification');
     return;
   }
   try {
-    const playerIds = await getPlayerIds(userId);
-    await pushFn(playerIds, title, message, data);
+    await notifyUserFn(userId, title, message, data);
   } catch (e) {
     console.error('[Verifier] Notification failed:', e.message);
   }
