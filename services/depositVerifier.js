@@ -21,19 +21,12 @@ const { parsePaymentEmail } = require('./paymentParser');
 /** Map<requestId, { intervalId, userId, amount, utr, iteration, startedAt }> */
 const activeJobs = new Map();
 
-/** Reference to the notifyUser function (injected at startup). */
-let notifyUserFn = null;
-
 // ── Init ───────────────────────────────────────────────────────────────────────
 
 /**
- * Store a reference to the push notification function so the verifier
- * can notify users when deposits are verified or expire.
- *
- * @param {Function} notifyUser
+ * Initialise the verifier.
  */
-function initVerifier(notifyUser) {
-  notifyUserFn = notifyUser;
+function initVerifier() {
   console.log('[Verifier] Initialised');
 }
 
@@ -48,15 +41,18 @@ function firestore() {
 }
 
 /**
- * Send a push notification to a user (no-op if notifyUserFn is not set).
+ * Send an event-driven push notification to a user.
  */
-async function notify(userId, title, message, data = {}) {
-  if (!notifyUserFn) {
-    console.warn('[Verifier] notifyUserFn not set – skipping notification');
-    return;
-  }
+async function notifyEvent(eventKey, userId, title, message, data = {}) {
   try {
-    await notifyUserFn(userId, title, message, data);
+    const { notifyByEvent } = require('./notificationEngine');
+    await notifyByEvent(
+      eventKey,
+      'user',
+      userId,
+      data,
+      { title, body: message }
+    );
   } catch (e) {
     console.error('[Verifier] Notification failed:', e.message);
   }
@@ -250,9 +246,11 @@ function startVerification(requestId, userId, amount, utr) {
   }
 
   const MAX_ITERATIONS = 100;
+  const MAX_CONSECUTIVE_ERRORS = 15; // Stop after 15 consecutive Gmail failures
   const INTERVAL_MS = 3000; // 3 seconds
   const startedAt = Date.now();
   let iteration = 0;
+  let consecutiveErrors = 0;
 
   const job = {
     userId,
@@ -285,9 +283,35 @@ function startVerification(requestId, userId, amount, utr) {
         message: 'Verification timed out'
       });
 
-      await notify(userId, 'Deposit Failed', `Your deposit of ₹${amount} could not be verified. Please contact support.`, {
+      await notifyEvent('deposit_rejected', userId, 'Deposit Failed', `Your deposit of ₹${amount} could not be verified. Please contact support.`, {
         type: 'deposit_expired',
-        requestId
+        requestId, amount
+      });
+
+      return;
+    }
+
+    // ── Check consecutive error limit ──
+    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      clearInterval(intervalId);
+      activeJobs.delete(requestId);
+
+      console.error(`[Verifier] Too many consecutive Gmail errors (${consecutiveErrors}) for ${requestId} – marking FAILED`);
+
+      await updateDepositStatus(requestId, userId, 'FAILED', {
+        failureReason: 'Verification service encountered repeated errors. Please contact support for manual verification.'
+      });
+
+      await appendVerificationLog(requestId, userId, {
+        iteration,
+        timestamp: Date.now(),
+        event: 'ERROR_LIMIT',
+        message: `Stopped after ${consecutiveErrors} consecutive Gmail errors`
+      });
+
+      await notifyEvent('deposit_rejected', userId, 'Deposit Verification Issue', `Your deposit of ₹${amount} could not be auto-verified due to a service issue. Our team will review it shortly.`, {
+        type: 'deposit_error',
+        requestId, amount
       });
 
       return;
@@ -297,6 +321,9 @@ function startVerification(requestId, userId, amount, utr) {
       // Fetch emails received since the job started (minus a 5-minute buffer)
       const sinceTs = startedAt - 5 * 60 * 1000;
       const emails = await fetchLatestPaymentEmails(sinceTs);
+
+      // Gmail call succeeded – reset error counter
+      consecutiveErrors = 0;
 
       let matched = false;
 
@@ -336,7 +363,7 @@ function startVerification(requestId, userId, amount, utr) {
               parsedData: parsed
             });
 
-            await notify(userId, 'Deposit Successful! 🎉', `₹${amount} has been added to your wallet.`, {
+            await notifyEvent('deposit_approved', userId, 'Deposit Successful! 🎉', `₹${amount} has been added to your wallet.`, {
               type: 'deposit_success',
               requestId,
               amount
@@ -353,9 +380,9 @@ function startVerification(requestId, userId, amount, utr) {
               message: 'UTR matched but wallet credit failed'
             });
 
-            await notify(userId, 'Deposit Issue', `Your deposit of ₹${amount} was found but could not be credited. Contact support.`, {
+            await notifyEvent('deposit_rejected', userId, 'Deposit Issue', `Your deposit of ₹${amount} was found but could not be credited. Contact support.`, {
               type: 'deposit_credit_failed',
-              requestId
+              requestId, amount
             });
           }
 
@@ -374,14 +401,15 @@ function startVerification(requestId, userId, amount, utr) {
       }
 
     } catch (err) {
-      console.error(`[Verifier] Error in iteration ${iteration} for ${requestId}:`, err.message);
+      consecutiveErrors++;
+      console.error(`[Verifier] Error in iteration ${iteration} for ${requestId} (consecutive: ${consecutiveErrors}):`, err.message);
 
       if (iteration % 10 === 0) {
         await appendVerificationLog(requestId, userId, {
           iteration,
           timestamp: Date.now(),
           event: 'ERROR',
-          message: err.message
+          message: `${err.message} (consecutive errors: ${consecutiveErrors})`
         });
       }
     }

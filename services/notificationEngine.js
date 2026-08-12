@@ -5,11 +5,101 @@ const admin = require('firebase-admin');
  * Handles dispatching push notifications via Firebase Cloud Messaging.
  */
 
-function replacePlaceholders(text, params) {
+function replacePlaceholders(text, params = {}) {
   if (!text) return text;
-  return text.replace(/\{\{([A-Z_]+)\}\}/g, (match, key) => {
-    return params[key] !== undefined ? params[key] : match;
+  return text.replace(/\{\{\s*([^{}]+?)\s*\}\}/g, (match, rawKey) => {
+    const key = rawKey.trim();
+    const value = params[key] ?? params[key.toUpperCase()] ?? params[key.toLowerCase()];
+    return value !== undefined && value !== null ? String(value) : match;
   });
+}
+
+/**
+ * Checks if an automatic notification event is enabled in Admin preferences.
+ * @param {string} eventKey 
+ * @returns {Promise<boolean>}
+ */
+async function shouldSendAutomaticNotification(eventKey) {
+  try {
+    const doc = await admin.firestore().collection('appConfig').doc('auto_notification_prefs').get();
+    if (!doc.exists) return true; // Default to true if not configured
+    const prefs = doc.data();
+    return prefs[eventKey] !== false; // Only disable if explicitly false
+  } catch (err) {
+    console.error(`[NotificationEngine] Error checking pref for ${eventKey}:`, err);
+    return true; // Failsafe
+  }
+}
+
+/**
+ * Dispatches an event-driven notification using a template if one is configured.
+ * @param {string} eventKey 
+ * @param {string} targetType - 'user', 'users', 'tournament', 'all'
+ * @param {string|string[]} targetId - userId, array of userIds, or tournamentId
+ * @param {object} params - Data to replace placeholders and attach to payload
+ * @param {object} defaultMessage - { title, body } fallback if no template exists
+ */
+async function notifyByEvent(eventKey, targetType, targetId, params, defaultMessage) {
+  const isEnabled = await shouldSendAutomaticNotification(eventKey);
+  if (!isEnabled) {
+    console.log(`[NotificationEngine] Event ${eventKey} is disabled in settings. Skipping.`);
+    return { success: true, skipped: true };
+  }
+
+  let title = defaultMessage.title;
+  let body = defaultMessage.body;
+
+  try {
+    // Check if there is an active template mapped to this eventKey (usageType)
+    // `usageType` is the explicit automatic trigger selected in Admin.  Older
+    // templates used `type`; retain that fallback only when it exactly matches
+    // an event key so broad categories such as "tournament" never win here.
+    let templatesSnap = await admin.firestore().collection('notificationTemplates')
+      .where('usageType', '==', eventKey).limit(1).get();
+    if (templatesSnap.empty) {
+      templatesSnap = await admin.firestore().collection('notificationTemplates')
+        .where('type', '==', eventKey).limit(1).get();
+    }
+      
+    if (!templatesSnap.empty) {
+      const template = templatesSnap.docs[0].data();
+      if (template.title && template.message) {
+        title = template.title;
+        body = template.message;
+        
+        // Pass along deep link or image if configured in template
+        if (template.deepLink) params.deepLink = template.deepLink;
+        if (template.imageUrl) params.image = template.imageUrl;
+      }
+    }
+  } catch (err) {
+    console.error(`[NotificationEngine] Error fetching template for ${eventKey}:`, err);
+  }
+
+  // Inject eventKey into params payload
+  const payloadData = { ...params, event_type: eventKey };
+
+  let result;
+  switch (targetType) {
+    case 'user':
+      result = await notifyUser(targetId, title, body, payloadData); break;
+    case 'users':
+      result = await notifyUsers(targetId, title, body, payloadData); break;
+    case 'tournament':
+      result = await notifyTournament(targetId, title, body, payloadData); break;
+    case 'all':
+      result = await notifyAll(title, body, payloadData); break;
+    default:
+      throw new Error(`Invalid targetType: ${targetType}`);
+  }
+  // Automatic sends share the same delivery history and count as manual sends.
+  await admin.firestore().collection('notificationHistory').add({
+    title, message: body, type: eventKey,
+    tournamentId: targetType === 'tournament' ? targetId : null,
+    targetCount: result.sentTo || 0,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  });
+  return result;
 }
 
 /**
@@ -40,7 +130,7 @@ async function notifyUser(userId, title, body, data = {}) {
     };
 
     const messages = fcmTokens.map(token => ({ token, params }));
-    return await sendPersonalized(messages, title, body, data);
+    return await sendPersonalized(messages, title, body, params);
   } catch (err) {
     console.error(`[NotificationEngine] Error notifying user ${userId}:`, err);
     return { success: false, error: err.message };
@@ -222,5 +312,7 @@ module.exports = {
   notifyTournament,
   notifyAll,
   dispatchNotification,
-  sendMulticast
+  sendMulticast,
+  shouldSendAutomaticNotification,
+  notifyByEvent
 };

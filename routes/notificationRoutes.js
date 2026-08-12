@@ -66,24 +66,42 @@ async function logHistory(title, message, type, tournamentId, count) {
    ROUTES
 ================================*/
 
-// Standard push notification
+// Standard push notification — supports type: all, selected, tournament, fcm_token
 router.post('/sendNotification', async (req, res) => {
   try {
-    const { title, message, type, selectedUsers = [], tournamentId = null } = req.body;
+    const { title, message, type, selectedUsers = [], tournamentId = null, fcmToken = null } = req.body;
 
     if (!title || !message) {
       return res.status(400).json({ success: false, error: "Missing data" });
     }
 
-    const result = await dispatchNotification({
-      title,
-      message,
-      type,
-      selectedUsers,
-      tournamentId
-    });
+    let result;
+
+    if (type === 'fcm_token' && fcmToken) {
+      // Direct send to a specific FCM token
+      result = await sendMulticast([fcmToken], title, message, { type });
+    } else {
+      result = await dispatchNotification({
+        title,
+        message,
+        type,
+        selectedUsers,
+        tournamentId
+      });
+    }
 
     await logHistory(title, message, type, tournamentId, result.sentTo || 0);
+
+    // Increment global sent counter
+    try {
+      const counterRef = db.collection('notificationStats').doc('global');
+      await counterRef.set({
+        totalSent: admin.firestore.FieldValue.increment(result.sentTo || 0),
+        lastSentAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+    } catch (counterErr) {
+      console.error('Counter update error:', counterErr);
+    }
 
     res.status(result.success ? 200 : 400).json(result);
   } catch (e) {
@@ -139,11 +157,30 @@ router.post('/supportStaffNotification', async (req, res) => {
   }
 });
 
+// ── Notification Count (fixes "Total Sent" stuck at 200) ──
+router.get('/notificationCount', async (_, res) => {
+  try {
+    // History stores the number of successful device deliveries for each send.
+    // Sum it rather than returning an old capped counter or merely row count.
+    const history = await db.collection("notificationHistory").get();
+    const totalSent = history.docs.reduce((sum, doc) => sum + Number(doc.get('targetCount') || 0), 0);
+    await db.collection('notificationStats').doc('global').set({
+      totalSent,
+      lastSentAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    res.json({ success: true, totalSent });
+  } catch (e) {
+    console.error("Notification count error:", e);
+    res.status(500).json({ success: false, error: e.message || "Failed to get count" });
+  }
+});
+
 // Schedule endpoints
 router.post('/scheduleNotification', async (req, res) => {
   let ref = null;
   try {
-    const { title, message, type, selectedUsers, tournamentId, scheduleConfig } = req.body;
+    const { title, message, type, selectedUsers, tournamentId, fcmToken, scheduleConfig } = req.body;
 
     if (!title || !message) {
       return res.status(400).json({ success: false, error: "Title and message are required" });
@@ -159,6 +196,7 @@ router.post('/scheduleNotification', async (req, res) => {
       type,
       selectedUsers: selectedUsers || [],
       tournamentId: tournamentId || null,
+      fcmToken: fcmToken || null,
       scheduleConfig,
       isActive: true,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
@@ -308,7 +346,9 @@ async function createScheduledJob(id, data) {
         scheduledJobs.delete(id);
         return;
       }
-      const result = await dispatchNotification(data);
+      const result = data.type === 'fcm_token'
+        ? await sendMulticast([data.fcmToken], data.title, data.message, { type: data.type })
+        : await dispatchNotification(data);
       await logHistory(data.title, data.message, data.type, data.tournamentId || null, result.sentTo || 0);
       
       // If oneTime, deactivate after running
@@ -351,7 +391,7 @@ initSchedules();
 
 router.post('/createTemplate', async (req, res) => {
   try {
-    const { name, title, message, type, placeholders, imageUrl, deepLink } = req.body;
+    const { name, title, message, type, usageType, placeholders, imageUrl, deepLink } = req.body;
     if (!name || !title || !message) {
       return res.status(400).json({ success: false, error: "Name, title, and message are required" });
     }
@@ -361,6 +401,7 @@ router.post('/createTemplate', async (req, res) => {
       title,
       message,
       type: type || "general",
+      usageType: usageType || null,
       placeholders: placeholders || [],
       imageUrl: imageUrl || null,
       deepLink: deepLink || null,
@@ -389,7 +430,7 @@ router.get('/templates', async (req, res) => {
 router.put('/updateTemplate/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, title, message, type, placeholders, imageUrl, deepLink } = req.body;
+    const { name, title, message, type, usageType, placeholders, imageUrl, deepLink } = req.body;
     if (!name || !title || !message) {
       return res.status(400).json({ success: false, error: "Name, title, and message are required" });
     }
@@ -399,6 +440,7 @@ router.put('/updateTemplate/:id', async (req, res) => {
       title,
       message,
       type: type || "general",
+      usageType: usageType || null,
       placeholders: placeholders || [],
       imageUrl: imageUrl || null,
       deepLink: deepLink || null,
@@ -421,6 +463,59 @@ router.delete('/deleteTemplate/:id', async (req, res) => {
   } catch (e) {
     console.error("Delete template error:", e);
     res.status(500).json({ success: false, error: e.message || "Failed to delete template" });
+  }
+});
+
+/* ===============================
+   NOTIFICATION HISTORY DELETE/CLEAR
+================================*/
+
+// Delete a single notification history entry
+router.delete('/notificationHistory/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ success: false, error: "History ID required" });
+
+    await db.collection("notificationHistory").doc(id).delete();
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Delete notification history error:", e);
+    res.status(500).json({ success: false, error: e.message || "Failed to delete history entry" });
+  }
+});
+
+// Clear all notification history
+router.delete('/notificationHistory', async (_, res) => {
+  try {
+    const snap = await db.collection("notificationHistory").get();
+    let batch = db.batch();
+    let count = 0;
+
+    for (const doc of snap.docs) {
+      batch.delete(doc.ref);
+      count++;
+
+      // Firestore batch limit is 500
+      if (count % 500 === 0) {
+        await batch.commit();
+        batch = db.batch();
+      }
+    }
+
+    if (count % 500 !== 0) {
+      await batch.commit();
+    }
+
+    // Reset the counter
+    await db.collection('notificationStats').doc('global').set({
+      totalSent: 0,
+      lastSentAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    res.json({ success: true, deletedCount: count });
+  } catch (e) {
+    console.error("Clear notification history error:", e);
+    res.status(500).json({ success: false, error: e.message || "Failed to clear history" });
   }
 });
 

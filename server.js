@@ -64,10 +64,10 @@ const rtdb = admin.database();
 ================================*/
 const { initGmail } = require('./services/gmailService');
 const { initVerifier } = require('./services/depositVerifier');
-const { notifyUser, notifyTournament } = require('./services/notificationEngine');
+const { notifyUser, notifyTournament, notifyByEvent } = require('./services/notificationEngine');
 const depositRoutes = require('./routes/depositRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
-const { initRoomTriggers } = require('./services/tournamentTriggers');
+const { initRoomTriggers, initTournamentNotificationTriggers } = require('./services/tournamentTriggers');
 
 // Initialise Gmail API and deposit verifier
 try {
@@ -95,6 +95,34 @@ try {
 
 // Initialize triggers
 initRoomTriggers();
+initTournamentNotificationTriggers();
+
+// Render owns this listener. Status changes are written by the admin app; the
+// listener sends exactly once through the same template-aware FCM engine.
+rtdb.ref('withdrawalRequests').on('child_changed', async snapshot => {
+  const request = snapshot.val() || {};
+  const status = String(request.status || '').toLowerCase();
+  if (!['approved', 'rejected'].includes(status)) return;
+  const eventKey = `withdrawal_${status}`;
+  try {
+    const claimed = await db.collection('notificationEventClaims').doc(`${eventKey}_${snapshot.key}`).create({
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    }).then(() => true).catch(error => {
+      if (error.code === 6 || error.code === 'already-exists') return false;
+      throw error;
+    });
+    if (!claimed) return;
+    await notifyByEvent(eventKey, 'user', request.userId || request.odcUserId, {
+      AMOUNT: request.amount || '', REQUEST_ID: snapshot.key,
+      deepLink: 'pgr://wallet/withdrawals'
+    }, {
+      title: status === 'approved' ? 'Withdrawal Approved' : 'Withdrawal Rejected',
+      body: `Your withdrawal of ₹{{AMOUNT}} has been ${status}.`
+    });
+  } catch (error) {
+    console.error('[Triggers] Withdrawal notification failed:', error.message);
+  }
+});
 
 
 
@@ -147,11 +175,18 @@ async function checkTournamentReminders() {
 
       if (data.reminderSent?.includes(offset)) continue;
 
-      await notifyTournament(
+      await notifyByEvent(
+        'tournament_reminder',
+        'tournament',
         doc.id,
-        "Tournament Reminder",
-        `${data.name} starts in ${offset} minutes`,
-        { type: "tournament_reminder" }
+        {
+          TOURNAMENT_NAME: data.name || 'Tournament',
+          MINUTES: offset,
+          DATE: data.startTime?.toDate?.().toLocaleDateString() || '',
+          TIME: data.startTime?.toDate?.().toLocaleTimeString() || '',
+          deepLink: `pgr://tournament/${doc.id}`
+        },
+        { title: 'Tournament Reminder', body: '{{TOURNAMENT_NAME}} starts in {{MINUTES}} minutes' }
       );
 
       await db.collection("tournaments").doc(doc.id).update({
