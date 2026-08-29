@@ -2,8 +2,9 @@
  * Deposit Routes
  *
  * Express Router for the deposit / payment flow:
- *   POST   /create              – create a new deposit request
- *   POST   /submit-utr          – submit Transaction ID and start verification
+ *   POST   /create              – create a new deposit request + ZapUPI order
+ *   POST   /submit-utr          – submit Transaction ID and start verification (legacy Gmail path)
+ *   POST   /zapupi-webhook      – ZapUPI payment webhook (unauthenticated)
  *   GET    /status/:requestId   – check deposit status
  *   POST   /cancel/:requestId   – cancel a deposit
  *   POST   /admin/override/:requestId – admin force-approve
@@ -19,6 +20,7 @@ const {
   getActiveJobs,
   creditWallet
 } = require('../services/depositVerifier');
+const { createOrder, getOrderStatus } = require('../services/zapupiService');
 
 const router = express.Router();
 
@@ -56,6 +58,42 @@ async function getAppConfig(key, defaultValue) {
   } catch (e) {
     console.error(`[Deposit] Failed to read appConfig/${key}:`, e.message);
     return defaultValue;
+  }
+}
+
+/**
+ * Send an event-driven push notification to a user.
+ */
+async function notifyEvent(eventKey, userId, title, message, data = {}) {
+  try {
+    const { notifyByEvent } = require('../services/notificationEngine');
+    await notifyByEvent(
+      eventKey,
+      'user',
+      userId,
+      data,
+      { title, body: message }
+    );
+  } catch (e) {
+    console.error('[Deposit] Notification failed:', e.message);
+  }
+}
+
+/**
+ * Append a log entry to the deposit's verificationLogs array in RTDB.
+ */
+async function appendVerificationLog(requestId, userId, logEntry) {
+  try {
+    const logRef = rtdb().ref(`wallets/${userId}/deposits/${requestId}/verificationLogs`);
+    const snap = await logRef.once('value');
+    const logs = snap.val() || [];
+    logs.push(logEntry);
+    await logRef.set(logs);
+
+    // Also update global record
+    await rtdb().ref(`depositOrders/${requestId}/verificationLogs`).set(logs);
+  } catch (e) {
+    console.error('[Deposit] Failed to append log:', e.message);
   }
 }
 
@@ -102,6 +140,22 @@ router.post('/create', verifyAuth, async (req, res) => {
 
     const now = Date.now();
 
+    // ── Create ZapUPI order ──
+    let zapupiResult;
+    try {
+      zapupiResult = await createOrder({
+        orderId: requestId,
+        amount,
+        remark: `PGR Deposit ${requestId} by ${userId}`
+      });
+    } catch (zapErr) {
+      console.error(`[Deposit] ZapUPI order creation failed for ${requestId}:`, zapErr.message);
+      return res.status(502).json({
+        success: false,
+        error: 'Payment gateway unavailable. Please try again later.'
+      });
+    }
+
     const depositRecord = {
       requestId,
       userId,
@@ -117,7 +171,14 @@ router.post('/create', verifyAuth, async (req, res) => {
       verificationSource: null,
       verificationLogs: [],
       failureReason: null,
-      processedBy: 'backend-auto'
+      processedBy: 'backend-auto',
+      // ZapUPI fields
+      zapupiOrderId: zapupiResult.orderId || requestId,
+      paymentUrl: zapupiResult.paymentUrl,
+      zapupiTxnId: null,
+      zapupiUtr: null,
+      webhookReceivedAt: null,
+      orderStatusCheckedAt: null
     };
 
     // Write to user-scoped deposits
@@ -126,14 +187,16 @@ router.post('/create', verifyAuth, async (req, res) => {
     // Write to global depositOrders
     await rtdb().ref(`depositOrders/${requestId}`).set(depositRecord);
 
-    console.log(`[Deposit] Created ${requestId} for user ${userId}, ₹${amount}`);
+    console.log(`[Deposit] Created ${requestId} for user ${userId}, ₹${amount} – ZapUPI paymentUrl ready`);
 
-    // Read admin UPI ID
+    // Read admin UPI ID (backward compat for manual deposit display)
     const adminUpiId = await getAppConfig('adminUpiId', null);
 
     return res.json({
       success: true,
       requestId,
+      orderId: zapupiResult.orderId || requestId,
+      paymentUrl: zapupiResult.paymentUrl,
       adminUpiId,
       amount
     });
@@ -148,6 +211,8 @@ router.post('/create', verifyAuth, async (req, res) => {
 });
 
 // ── POST /submit-utr ──────────────────────────────────────────────────────────
+// Legacy route: user-submitted UTR triggers Gmail-based verification.
+// Preserved for backward compatibility until Gmail system is fully removed.
 
 router.post('/submit-utr', verifyAuth, async (req, res) => {
   try {
@@ -251,6 +316,265 @@ router.post('/submit-utr', verifyAuth, async (req, res) => {
   }
 });
 
+// ── POST /zapupi-webhook ──────────────────────────────────────────────────────
+// ZapUPI calls this endpoint when a payment status changes.
+// NO Firebase auth — ZapUPI cannot provide a Firebase token.
+//
+// Security:
+//   - Optional IP whitelist (ZAPUPI_GATEWAY_IP env var)
+//   - Server-side order-status verification (never trust webhook alone)
+//   - Idempotency via deposit status guard + creditWallet's own guards
+
+router.post('/zapupi-webhook', async (req, res) => {
+  try {
+    // Always return 200 to ZapUPI to prevent infinite retries
+    const respondOk = () => res.status(200).json({ status: 'ok' });
+
+    const payload = req.body;
+
+    console.log('[Deposit] ZapUPI webhook received:', JSON.stringify(payload));
+
+    // ── Optional IP whitelist ──
+    const gatewayIp = process.env.ZAPUPI_GATEWAY_IP;
+    if (gatewayIp) {
+      const clientIp = req.ip || req.connection?.remoteAddress || '';
+      // Handle IPv6-mapped IPv4 (e.g. ::ffff:148.135.143.154)
+      const normalizedIp = clientIp.replace(/^::ffff:/, '');
+      if (normalizedIp !== gatewayIp) {
+        console.warn(`[Deposit] Webhook from unexpected IP: ${clientIp} (expected ${gatewayIp})`);
+        // Still return 200 – don't leak info about validation
+        return respondOk();
+      }
+    }
+
+    // ── Validate payload ──
+    if (!payload || !payload.order_id) {
+      console.error('[Deposit] Webhook missing order_id');
+      return respondOk();
+    }
+
+    const webhookOrderId = String(payload.order_id);
+    const webhookStatus = String(payload.status || '');
+    const webhookAmount = parseFloat(payload.amount) || 0;
+    const webhookUtr = payload.utr || null;
+    const webhookTxnId = payload.txn_id || null;
+
+    console.log(`[Deposit] Webhook: orderId=${webhookOrderId}, status=${webhookStatus}, amount=${webhookAmount}`);
+
+    // ── Fetch deposit record ──
+    // The ZapUPI order_id IS the PGR requestId
+    const requestId = webhookOrderId;
+    const depositSnap = await rtdb().ref(`depositOrders/${requestId}`).once('value');
+    const deposit = depositSnap.val();
+
+    if (!deposit) {
+      console.error(`[Deposit] Webhook: deposit not found for requestId=${requestId}`);
+      return respondOk();
+    }
+
+    // ── Idempotency: already processed ──
+    if (deposit.status === 'SUCCESS') {
+      console.log(`[Deposit] Webhook: deposit ${requestId} already SUCCESS – ignoring duplicate`);
+      return respondOk();
+    }
+
+    // ── Only process automatic deposits ──
+    if (deposit.depositType !== 'automatic') {
+      console.warn(`[Deposit] Webhook: deposit ${requestId} is ${deposit.depositType}, not automatic – ignoring`);
+      return respondOk();
+    }
+
+    // ── Atomic Claim: Ensure only ONE request can process this specific deposit ──
+    // Atomically transition status from PENDING to PROCESSING using RTDB transaction.
+    // If status is not PENDING (e.g. already PROCESSING, VERIFYING, SUCCESS, FAILED), the transaction aborts.
+    const statusRef = rtdb().ref(`depositOrders/${requestId}/status`);
+    const claimTxResult = await statusRef.transaction((currentStatus) => {
+      if (currentStatus === 'PENDING') {
+        return 'PROCESSING';
+      }
+      return; // returning undefined aborts the transaction
+    });
+
+    if (!claimTxResult.committed) {
+      console.log(`[Deposit] Webhook: deposit ${requestId} already claimed or processed (status was not PENDING) – ignoring duplicate`);
+      return respondOk();
+    }
+
+    const userId = deposit.userId;
+    const expectedAmount = deposit.amount;
+
+    // Mirror the claimed PROCESSING status to the user-scoped record
+    await rtdb().ref(`wallets/${userId}/deposits/${requestId}/status`).set('PROCESSING');
+
+    // Record that webhook was received
+    await rtdb().ref(`wallets/${userId}/deposits/${requestId}/webhookReceivedAt`).set(Date.now());
+    await rtdb().ref(`depositOrders/${requestId}/webhookReceivedAt`).set(Date.now());
+
+    // ── Handle non-success webhook ──
+    if (webhookStatus !== 'Success') {
+      console.log(`[Deposit] Webhook: non-success status "${webhookStatus}" for ${requestId}`);
+
+      await appendVerificationLog(requestId, userId, {
+        timestamp: Date.now(),
+        event: 'WEBHOOK_NON_SUCCESS',
+        message: `ZapUPI webhook status: ${webhookStatus}`,
+        webhookData: { status: webhookStatus, amount: webhookAmount, txnId: webhookTxnId }
+      });
+
+      // Revert status back to PENDING so user/gateway can retry
+      await rtdb().ref(`depositOrders/${requestId}/status`).set('PENDING');
+      await rtdb().ref(`wallets/${userId}/deposits/${requestId}/status`).set('PENDING');
+
+      return respondOk();
+    }
+
+    // ── Webhook says Success — VERIFY independently via Order Status API ──
+    console.log(`[Deposit] Webhook success for ${requestId} – verifying via Order Status API...`);
+
+    let orderStatus;
+    try {
+      orderStatus = await getOrderStatus(requestId);
+    } catch (statusErr) {
+      console.error(`[Deposit] Order Status API call failed for ${requestId}:`, statusErr.message);
+
+      await appendVerificationLog(requestId, userId, {
+        timestamp: Date.now(),
+        event: 'STATUS_API_FAILED',
+        message: `Order Status API call failed: ${statusErr.message}`,
+        webhookData: { status: webhookStatus, amount: webhookAmount }
+      });
+
+      // Revert status back to PENDING so future webhook retries from ZapUPI can re-claim and process
+      await rtdb().ref(`depositOrders/${requestId}/status`).set('PENDING');
+      await rtdb().ref(`wallets/${userId}/deposits/${requestId}/status`).set('PENDING');
+
+      return respondOk();
+    }
+
+    // Record status check timestamp
+    await rtdb().ref(`wallets/${userId}/deposits/${requestId}/orderStatusCheckedAt`).set(Date.now());
+    await rtdb().ref(`depositOrders/${requestId}/orderStatusCheckedAt`).set(Date.now());
+
+    // ── Verify status from Order Status API ──
+    if (orderStatus.status !== 'Success') {
+      console.warn(`[Deposit] Order Status API says "${orderStatus.status}" for ${requestId} (webhook said Success) – aborting`);
+
+      await appendVerificationLog(requestId, userId, {
+        timestamp: Date.now(),
+        event: 'STATUS_MISMATCH',
+        message: `Webhook said Success but Order Status API says: ${orderStatus.status}`,
+        orderStatusData: orderStatus
+      });
+
+      // Revert status back to PENDING
+      await rtdb().ref(`depositOrders/${requestId}/status`).set('PENDING');
+      await rtdb().ref(`wallets/${userId}/deposits/${requestId}/status`).set('PENDING');
+
+      return respondOk();
+    }
+
+    // ── Verify amount ──
+    const confirmedAmount = orderStatus.amount;
+    if (Math.abs(confirmedAmount - expectedAmount) >= 0.01) {
+      console.error(`[Deposit] Amount mismatch for ${requestId}: expected=${expectedAmount}, confirmed=${confirmedAmount}`);
+
+      const failUpdate = {
+        status: 'FAILED',
+        failureReason: `Amount mismatch: expected ₹${expectedAmount}, got ₹${confirmedAmount}`
+      };
+      await rtdb().ref(`wallets/${userId}/deposits/${requestId}`).update(failUpdate);
+      await rtdb().ref(`depositOrders/${requestId}`).update(failUpdate);
+
+      await appendVerificationLog(requestId, userId, {
+        timestamp: Date.now(),
+        event: 'AMOUNT_MISMATCH',
+        message: `Expected ₹${expectedAmount}, confirmed ₹${confirmedAmount}`,
+        orderStatusData: orderStatus
+      });
+
+      await notifyEvent('deposit_rejected', userId, 'Deposit Issue',
+        `Your deposit of ₹${expectedAmount} could not be verified due to an amount mismatch. Please contact support.`, {
+          type: 'deposit_amount_mismatch',
+          requestId,
+          amount: expectedAmount
+        });
+
+      return respondOk();
+    }
+
+    // ── All verifications passed — set status to VERIFYING so creditWallet guard passes ──
+    await rtdb().ref(`wallets/${userId}/deposits/${requestId}/status`).set('VERIFYING');
+    await rtdb().ref(`depositOrders/${requestId}/status`).set('VERIFYING');
+
+    // ── Credit wallet ──
+    const credited = await creditWallet(userId, expectedAmount, requestId);
+
+    if (!credited) {
+      console.error(`[Deposit] creditWallet failed for ${requestId}`);
+
+      // creditWallet may have set status to FAILED (duplicate UTR) — check
+      const recheckSnap = await rtdb().ref(`depositOrders/${requestId}/status`).once('value');
+      const recheckStatus = recheckSnap.val();
+
+      if (recheckStatus !== 'FAILED') {
+        // creditWallet failed for another reason — revert to PENDING
+        await rtdb().ref(`wallets/${userId}/deposits/${requestId}/status`).set('PENDING');
+        await rtdb().ref(`depositOrders/${requestId}/status`).set('PENDING');
+      }
+
+      await appendVerificationLog(requestId, userId, {
+        timestamp: Date.now(),
+        event: 'CREDIT_FAILED',
+        message: 'ZapUPI verified but wallet credit failed',
+        orderStatusData: orderStatus
+      });
+
+      return respondOk();
+    }
+
+    // ── Success — update deposit record with ZapUPI metadata ──
+    const successUpdate = {
+      status: 'SUCCESS',
+      verifiedAt: Date.now(),
+      verificationSource: 'zapupi',
+      processedBy: 'backend-auto',
+      zapupiTxnId: orderStatus.txnId || webhookTxnId || null,
+      zapupiUtr: orderStatus.utr || webhookUtr || null,
+      utr: orderStatus.utr || webhookUtr || null // Also set legacy utr field for admin visibility
+    };
+
+    await rtdb().ref(`wallets/${userId}/deposits/${requestId}`).update(successUpdate);
+    await rtdb().ref(`depositOrders/${requestId}`).update(successUpdate);
+
+    console.log(`[Deposit] ✅ ZapUPI deposit SUCCESS: ${requestId}, ₹${expectedAmount} credited to ${userId}`);
+
+    await appendVerificationLog(requestId, userId, {
+      timestamp: Date.now(),
+      event: 'SUCCESS',
+      message: `ZapUPI payment verified and wallet credited`,
+      zapupiData: {
+        txnId: orderStatus.txnId,
+        utr: orderStatus.utr,
+        confirmedAmount: confirmedAmount
+      }
+    });
+
+    await notifyEvent('deposit_approved', userId, 'Deposit Successful! 🎉',
+      `₹${expectedAmount} has been added to your wallet.`, {
+        type: 'deposit_success',
+        requestId,
+        amount: expectedAmount
+      });
+
+    return respondOk();
+
+  } catch (err) {
+    console.error('[Deposit] Webhook processing error:', err);
+    // Always return 200 to prevent ZapUPI retries on internal errors
+    return res.status(200).json({ status: 'ok' });
+  }
+});
+
 // ── GET /status/:requestId ─────────────────────────────────────────────────────
 
 router.get('/status/:requestId', verifyAuth, async (req, res) => {
@@ -278,7 +602,7 @@ router.get('/status/:requestId', verifyAuth, async (req, res) => {
 
     // Build a human-readable message
     const statusMessages = {
-      PENDING: 'Waiting for Transaction ID submission',
+      PENDING: 'Waiting for payment',
       VERIFYING: 'Verifying payment – this may take a few minutes',
       SUCCESS: 'Payment verified and wallet credited',
       FAILED: deposit.failureReason || 'Verification failed',
@@ -293,6 +617,7 @@ router.get('/status/:requestId', verifyAuth, async (req, res) => {
       utr: deposit.utr,
       verifiedAt: deposit.verifiedAt || null,
       createdAt: deposit.createdAt,
+      paymentUrl: deposit.paymentUrl || null,
       message: statusMessages[deposit.status] || deposit.status
     });
 
@@ -337,7 +662,7 @@ router.post('/cancel/:requestId', verifyAuth, async (req, res) => {
       });
     }
 
-    // If VERIFYING, stop the background job
+    // If VERIFYING, stop the background job (legacy Gmail path)
     if (deposit.status === 'VERIFYING') {
       cancelVerification(requestId);
     }

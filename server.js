@@ -17,6 +17,7 @@ const app = express();
 ================================*/
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
   console.log("Incoming request:", req.method, req.url);
@@ -62,21 +63,26 @@ const rtdb = admin.database();
 /* ===============================
    DEPOSIT SYSTEM INIT
 ================================*/
-const { initGmail } = require('./services/gmailService');
 const { initVerifier } = require('./services/depositVerifier');
 const { notifyUser, notifyTournament, notifyByEvent } = require('./services/notificationEngine');
 const depositRoutes = require('./routes/depositRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const { initRoomTriggers, initTournamentNotificationTriggers } = require('./services/tournamentTriggers');
 
-// Initialise Gmail API and deposit verifier
-try {
-  initGmail();
-  console.log('✓ Gmail initialized');
-} catch (err) {
-  console.error('Gmail init failed (deposits will not auto-verify):', err.message);
+// Gmail init — legacy, only attempt if env vars are present
+if (process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN) {
+  try {
+    const { initGmail } = require('./services/gmailService');
+    initGmail();
+    console.log('✓ Gmail initialized (legacy – ZapUPI is primary)');
+  } catch (err) {
+    console.warn('Gmail init failed (non-critical – ZapUPI is primary):', err.message);
+  }
+} else {
+  console.log('ℹ Gmail not configured – skipped (ZapUPI is primary deposit method)');
 }
 
+// Deposit verifier — still needed for creditWallet (used by admin override and webhook)
 try {
   initVerifier(notifyUser);
   console.log('✓ Deposit Verifier initialized');
@@ -140,7 +146,7 @@ app.get("/health", (_, res) => {
       firebase: admin.apps.length > 0 ? "connected" : "disconnected",
       firestore: "connected",
       rtdb: "connected",
-      gmail: "initialized",
+      zapupi: "configured",
       notifications: "initialized"
     }
   });

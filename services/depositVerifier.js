@@ -186,9 +186,10 @@ async function creditWallet(userId, amount, requestId) {
     console.error('[Verifier] Firestore balance update failed (RTDB is source of truth):', e.message);
   }
 
-  // 5. Create transaction record
-  const txnId = `TXN_DEP_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  // 5. Create transaction record (deterministic key for idempotency)
+  const txnId = `TXN_DEP_${requestId}`;
   const txnRecord = {
+    id: txnId,
     txnId,
     type: 'deposit',
     amount,

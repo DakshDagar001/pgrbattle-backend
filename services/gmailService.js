@@ -15,26 +15,45 @@ const { google } = require('googleapis');
 let gmail = null;
 let oauth2Client = null;
 
+/** Track consecutive auth failures to avoid infinite retry loops. */
+let consecutiveAuthFailures = 0;
+const MAX_AUTH_FAILURES = 3;
+
 /** Set of Gmail message IDs that have already been fetched & returned. */
 const processedMessageIds = new Set();
-
-// ── Paths ──────────────────────────────────────────────────────────────────────
-const CREDENTIALS_PATH = path.join(__dirname, '..', 'config', 'gmail-oauth.json');
-const TOKEN_PATH = path.join(__dirname, '..', 'token.json');
 
 // ── Initialisation ─────────────────────────────────────────────────────────────
 
 /**
- * Build the OAuth2 client and bootstrap the Gmail API instance.
- * Safe to call multiple times – subsequent calls are no-ops.
+ * Sanitize a credential string – strip whitespace, newlines, carriage returns.
+ * This prevents "Invalid Header" errors caused by trailing \n or \r in env vars.
  */
-function initGmail() {
-  if (gmail) return; // already initialised
+function sanitizeCredential(value) {
+  if (!value) return value;
+  return value.replace(/[\r\n]+/g, '').trim();
+}
 
-  const clientId = process.env.GMAIL_CLIENT_ID;
-  const clientSecret = process.env.GMAIL_CLIENT_SECRET;
-  const redirectUri = process.env.GMAIL_REDIRECT_URI;
-  const refreshToken = process.env.GMAIL_REFRESH_TOKEN;
+/**
+ * Build the OAuth2 client and bootstrap the Gmail API instance.
+ * Safe to call multiple times – subsequent calls are no-ops unless forceReinit is true.
+ *
+ * @param {boolean} forceReinit – if true, tear down existing client and rebuild
+ */
+function initGmail(forceReinit = false) {
+  if (gmail && !forceReinit) return; // already initialised
+
+  // Tear down existing client if force-reiniting
+  if (forceReinit) {
+    gmail = null;
+    oauth2Client = null;
+    console.log('[Gmail] Force re-initialising client');
+  }
+
+  // Sanitize credentials to prevent Invalid Header errors
+  const clientId = sanitizeCredential(process.env.GMAIL_CLIENT_ID);
+  const clientSecret = sanitizeCredential(process.env.GMAIL_CLIENT_SECRET);
+  const redirectUri = sanitizeCredential(process.env.GMAIL_REDIRECT_URI);
+  const refreshToken = sanitizeCredential(process.env.GMAIL_REFRESH_TOKEN);
 
   if (!clientId || !clientSecret || !redirectUri || !refreshToken) {
     throw new Error('Missing one or more required Gmail environment variables.');
@@ -50,12 +69,34 @@ function initGmail() {
   // Listen for automatic token refreshes
   oauth2Client.on('tokens', (newTokens) => {
     console.log('[Gmail] Token refreshed successfully');
-    // Note: In a robust setup, you might want to save the new refresh_token back to your DB/Env if it changes.
+    consecutiveAuthFailures = 0; // reset failure counter on success
   });
 
   // Create Gmail client
   gmail = google.gmail({ version: 'v1', auth: oauth2Client });
   console.log('[Gmail] Service initialised successfully');
+}
+
+/**
+ * Force the OAuth2 client to refresh its access token.
+ * Call this when encountering auth-related errors.
+ */
+async function forceTokenRefresh() {
+  if (!oauth2Client) {
+    console.error('[Gmail] Cannot refresh token – OAuth2 client not initialised');
+    return false;
+  }
+  try {
+    console.log('[Gmail] Forcing access token refresh...');
+    const { credentials } = await oauth2Client.refreshAccessToken();
+    oauth2Client.setCredentials(credentials);
+    console.log('[Gmail] Access token refreshed successfully');
+    consecutiveAuthFailures = 0;
+    return true;
+  } catch (err) {
+    console.error('[Gmail] Force token refresh failed:', err.message);
+    return false;
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -119,10 +160,29 @@ function getSubject(messageData) {
   return subjectHeader ? subjectHeader.value : '';
 }
 
+/**
+ * Check if an error is related to auth / header issues.
+ */
+function isAuthOrHeaderError(err) {
+  const msg = (err.message || '').toLowerCase();
+  const code = err.code || err.status || 0;
+  return (
+    code === 401 || code === 403 ||
+    msg.includes('invalid header') ||
+    msg.includes('invalid_grant') ||
+    msg.includes('token') ||
+    msg.includes('unauthorized') ||
+    msg.includes('forbidden')
+  );
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 /**
  * Fetch payment emails from FamPay received after `sinceTimestamp` (epoch ms).
+ *
+ * Includes retry logic: on auth/header errors, force-refreshes the token
+ * and retries once. On persistent failure, re-initialises the entire Gmail client.
  *
  * @param {number} sinceTimestamp – Unix epoch **milliseconds**
  * @returns {Promise<Array<{messageId: string, body: string, subject: string, snippet: string, receivedAt: number}>>}
@@ -135,75 +195,93 @@ async function fetchLatestPaymentEmails(sinceTimestamp) {
   const sinceEpochSeconds = Math.floor((sinceTimestamp || 0) / 1000);
   const query = `from:no-reply@famapp.in after:${sinceEpochSeconds}`;
 
-  console.log('[Gmail] Querying:', query);
+  // Attempt up to 2 tries: first with current token, second after refresh
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const listRes = await gmail.users.messages.list({
+        userId: 'me',
+        q: query,
+        maxResults: 20
+      });
 
-  try {
-    const listRes = await gmail.users.messages.list({
-      userId: 'me',
-      q: query,
-      maxResults: 20
-    });
-
-    const messages = listRes.data.messages;
-    if (!messages || messages.length === 0) {
-      console.log('[Gmail] No new payment emails found');
-      return [];
-    }
-
-    console.log(`[Gmail] Found ${messages.length} message(s), filtering already-processed`);
-
-    const results = [];
-
-    for (const msgMeta of messages) {
-      // Skip messages we have already returned in a previous call
-      if (processedMessageIds.has(msgMeta.id)) {
-        continue;
+      const messages = listRes.data.messages;
+      if (!messages || messages.length === 0) {
+        consecutiveAuthFailures = 0; // API call succeeded
+        return [];
       }
 
-      try {
-        const msgRes = await gmail.users.messages.get({
-          userId: 'me',
-          id: msgMeta.id,
-          format: 'full'
-        });
+      const results = [];
 
-        const msgData = msgRes.data;
-
-        // Prefer plain text, fall back to HTML
-        let body = extractBodyFromPayload(msgData.payload, 'text/plain');
-        if (!body) {
-          body = extractBodyFromPayload(msgData.payload, 'text/html');
+      for (const msgMeta of messages) {
+        // Skip messages we have already returned in a previous call
+        if (processedMessageIds.has(msgMeta.id)) {
+          continue;
         }
 
-        const subject = getSubject(msgData);
-        const receivedAt = getReceivedAt(msgData);
+        try {
+          const msgRes = await gmail.users.messages.get({
+            userId: 'me',
+            id: msgMeta.id,
+            format: 'full'
+          });
 
-        results.push({
-          messageId: msgMeta.id,
-          body,
-          subject,
-          snippet: msgData.snippet || '',
-          receivedAt
-        });
+          const msgData = msgRes.data;
 
-        // Mark as processed so future calls skip it
-        processedMessageIds.add(msgMeta.id);
-      } catch (msgErr) {
-        console.error(`[Gmail] Failed to fetch message ${msgMeta.id}:`, msgErr.message);
-        // Continue with remaining messages
+          // Prefer plain text, fall back to HTML
+          let body = extractBodyFromPayload(msgData.payload, 'text/plain');
+          if (!body) {
+            body = extractBodyFromPayload(msgData.payload, 'text/html');
+          }
+
+          const subject = getSubject(msgData);
+          const receivedAt = getReceivedAt(msgData);
+
+          results.push({
+            messageId: msgMeta.id,
+            body,
+            subject,
+            snippet: msgData.snippet || '',
+            receivedAt
+          });
+
+          // Mark as processed so future calls skip it
+          processedMessageIds.add(msgMeta.id);
+        } catch (msgErr) {
+          console.error(`[Gmail] Failed to fetch message ${msgMeta.id}:`, msgErr.message);
+          // Continue with remaining messages
+        }
+      }
+
+      // Success – reset failure counter
+      consecutiveAuthFailures = 0;
+      console.log(`[Gmail] Returning ${results.length} new email(s)`);
+      return results;
+
+    } catch (err) {
+      console.error(`[Gmail] Attempt ${attempt} failed:`, err.message);
+
+      if (isAuthOrHeaderError(err) && attempt === 1) {
+        // First failure – try refreshing the token
+        consecutiveAuthFailures++;
+        console.warn(`[Gmail] Auth/header error detected (consecutive: ${consecutiveAuthFailures}). Refreshing token...`);
+
+        const refreshed = await forceTokenRefresh();
+        if (!refreshed && consecutiveAuthFailures >= MAX_AUTH_FAILURES) {
+          // Multiple consecutive failures – full re-init
+          console.warn('[Gmail] Multiple auth failures – re-initialising Gmail client');
+          initGmail(true);
+        }
+        // Loop continues to attempt 2
+      } else {
+        // Non-auth error or second attempt failed
+        consecutiveAuthFailures++;
+        throw err;
       }
     }
-
-    console.log(`[Gmail] Returning ${results.length} new email(s)`);
-    return results;
-  } catch (err) {
-    console.error('[Gmail] Failed to list messages:', err.message);
-    // If the error is an auth issue, try to provide a clearer message
-    if (err.code === 401 || err.code === 403) {
-      console.error('[Gmail] Authentication error – token may need to be regenerated');
-    }
-    throw err;
   }
+
+  // Should not reach here, but just in case
+  return [];
 }
 
 module.exports = {
