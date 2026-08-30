@@ -22,8 +22,7 @@ function validateEnv() {
     'GMAIL_CLIENT_SECRET',
     'GMAIL_REDIRECT_URI',
     'GMAIL_REFRESH_TOKEN',
-    'ZAPUPI_TOKEN_KEY',
-    'ZAPUPI_SECRET_KEY',
+    'ZAPUPI_KEY',
     'ZAPUPI_WEBHOOK_URL',
     'PORT'
   ];
@@ -63,8 +62,7 @@ function validateEnv() {
 
   // Required ZapUPI Configuration
   const requiredZapupiVars = [
-    'ZAPUPI_TOKEN_KEY',
-    'ZAPUPI_SECRET_KEY',
+    'ZAPUPI_KEY',
     'ZAPUPI_WEBHOOK_URL'
   ];
 
@@ -93,7 +91,9 @@ function validateEnv() {
     'ONESIGNAL_APP_ID',
     'ONESIGNAL_API_KEY',
     'GMAIL_OAUTH_CREDENTIALS',
-    'GMAIL_OAUTH_TOKEN'
+    'GMAIL_OAUTH_TOKEN',
+    'ZAPUPI_TOKEN_KEY',
+    'ZAPUPI_SECRET_KEY'
   ];
 
   obsoleteVars.forEach((envVar) => {

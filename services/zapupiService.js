@@ -6,34 +6,32 @@
  *   - getOrderStatus() – query the status of an existing order
  *
  * Uses axios (already a project dependency).
- * Reads ZAPUPI_TOKEN_KEY and ZAPUPI_SECRET_KEY from process.env.
+ * Reads ZAPUPI_KEY from process.env (sent as zap_key in JSON body).
  *
  * API Reference: see /ZAPUPI.md in project root.
  */
 
 const axios = require('axios');
-const qs = require('querystring');
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const ZAPUPI_CREATE_ORDER_URL = 'https://api.zapupi.com/api/create-order';
-const ZAPUPI_ORDER_STATUS_URL = 'https://api.zapupi.com/api/order-status';
+const ZAPUPI_CREATE_ORDER_URL = 'https://pay.zapupi.com/api/create-order';
+const ZAPUPI_ORDER_STATUS_URL = 'https://pay.zapupi.com/api/order-status';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
- * Return the two ZapUPI keys from the environment.
- * Throws if either is missing (should be caught at startup by envValidator).
+ * Return the ZapUPI API key from the environment.
+ * Throws if missing (should be caught at startup by envValidator).
  */
-function getKeys() {
-  const tokenKey = process.env.ZAPUPI_TOKEN_KEY;
-  const secretKey = process.env.ZAPUPI_SECRET_KEY;
+function getZapKey() {
+  const zapKey = process.env.ZAPUPI_KEY;
 
-  if (!tokenKey || !secretKey) {
-    throw new Error('[ZapUPI] Missing ZAPUPI_TOKEN_KEY or ZAPUPI_SECRET_KEY');
+  if (!zapKey) {
+    throw new Error('[ZapUPI] Missing ZAPUPI_KEY environment variable');
   }
 
-  return { tokenKey, secretKey };
+  return zapKey;
 }
 
 // ── Create Order ──────────────────────────────────────────────────────────────
@@ -47,29 +45,32 @@ function getKeys() {
  * @param {string} [params.customerMobile] – optional customer phone number
  * @param {string} [params.remark]      – optional note for traceability
  * @param {string} [params.redirectUrl] – optional redirect after payment
+ * @param {string} [params.webhookUrl]  – optional custom webhook URL
  *
  * @returns {Promise<{ paymentUrl: string, orderId: string, paymentData: string|null, autoCheckUrl: string|null, utrCheckUrl: string|null }>}
  * @throws {Error} on network failure or ZapUPI error response
  */
-async function createOrder({ orderId, amount, customerMobile, remark, redirectUrl }) {
-  const { tokenKey, secretKey } = getKeys();
+async function createOrder({ orderId, amount, customerMobile, remark, redirectUrl, webhookUrl }) {
+  const zapKey = getZapKey();
 
   const body = {
-    token_key: tokenKey,
-    secret_key: secretKey,
-    amount: Math.round(amount), // ZapUPI expects integer
-    order_id: orderId
+    zap_key: zapKey,
+    order_id: String(orderId),
+    amount: String(Math.round(amount))
   };
 
-  if (customerMobile) body.custumer_mobile = customerMobile; // ZapUPI uses "custumer" (their typo)
-  if (remark) body.remark = remark;
-  if (redirectUrl) body.redirect_url = redirectUrl;
+  if (customerMobile) body.customer_mobile = String(customerMobile);
+  if (remark) body.remark = String(remark);
+  if (redirectUrl) body.redirect_url = String(redirectUrl);
+  if (webhookUrl || process.env.ZAPUPI_WEBHOOK_URL) {
+    body.webhook_url = webhookUrl || process.env.ZAPUPI_WEBHOOK_URL;
+  }
 
   console.log(`[ZapUPI] Creating order: orderId=${orderId}, amount=${amount}`);
 
   try {
-    const response = await axios.post(ZAPUPI_CREATE_ORDER_URL, qs.stringify(body), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    const response = await axios.post(ZAPUPI_CREATE_ORDER_URL, body, {
+      headers: { 'Content-Type': 'application/json' },
       timeout: 15000 // 15 second timeout
     });
 
@@ -81,11 +82,11 @@ async function createOrder({ orderId, amount, customerMobile, remark, redirectUr
       throw new Error(`ZapUPI order creation failed: ${msg}`);
     }
 
-    console.log(`[ZapUPI] Order created: orderId=${data.order_id}, paymentUrl=${data.payment_url}`);
+    console.log(`[ZapUPI] Order created: orderId=${data.order_id || orderId}, paymentUrl=${data.payment_url}`);
 
     return {
       paymentUrl: data.payment_url,
-      orderId: data.order_id,
+      orderId: data.order_id || orderId,
       paymentData: data.payment_data || null,
       autoCheckUrl: data.auto_check_every_2_sec || null,
       utrCheckUrl: data.utr_check || null
@@ -111,23 +112,22 @@ async function createOrder({ orderId, amount, customerMobile, remark, redirectUr
  *
  * @param {string} orderId – the ZapUPI order_id (= PGR requestId)
  *
- * @returns {Promise<{ status: string, amount: number, utr: string|null, txnId: string|null, customerMobile: string|null, remark: string|null, createdAt: string|null, orderId: string }>}
+ * @returns {Promise<{ status: string, amount: number, utr: string|null, txnId: string|null, customerMobile: string|null, remark: string|null, createdAt: string|null, environment: string|null, orderId: string }>}
  * @throws {Error} on network failure or ZapUPI error response
  */
 async function getOrderStatus(orderId) {
-  const { tokenKey, secretKey } = getKeys();
+  const zapKey = getZapKey();
 
   const body = {
-    token_key: tokenKey,
-    secret_key: secretKey,
-    order_id: orderId
+    zap_key: zapKey,
+    order_id: String(orderId)
   };
 
   console.log(`[ZapUPI] Checking order status: orderId=${orderId}`);
 
   try {
-    const response = await axios.post(ZAPUPI_ORDER_STATUS_URL, qs.stringify(body), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    const response = await axios.post(ZAPUPI_ORDER_STATUS_URL, body, {
+      headers: { 'Content-Type': 'application/json' },
       timeout: 15000
     });
 
@@ -141,17 +141,18 @@ async function getOrderStatus(orderId) {
 
     const orderData = data.data;
 
-    console.log(`[ZapUPI] Order status: orderId=${orderData.order_id}, status=${orderData.status}, amount=${orderData.amount}`);
+    console.log(`[ZapUPI] Order status: orderId=${orderData.order_id}, status=${orderData.status}, amount=${orderData.amount || orderData.pay_amount}`);
 
     return {
       status: orderData.status,
-      amount: parseFloat(orderData.amount) || 0,
+      amount: parseFloat(orderData.pay_amount || orderData.amount) || 0,
       utr: orderData.utr || null,
       txnId: orderData.txn_id || null,
-      customerMobile: orderData.custumer_mobile || null,
+      customerMobile: orderData.customer_mobile || orderData.custumer_mobile || null,
       remark: orderData.remark || null,
       createdAt: orderData.create_at || null,
-      orderId: orderData.order_id
+      environment: orderData.environment || null,
+      orderId: orderData.order_id || orderId
     };
   } catch (err) {
     if (err.response) {

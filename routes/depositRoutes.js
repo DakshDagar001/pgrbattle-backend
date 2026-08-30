@@ -338,7 +338,7 @@ router.post('/zapupi-webhook', async (req, res) => {
     const gatewayIp = process.env.ZAPUPI_GATEWAY_IP;
     if (gatewayIp) {
       const clientIp = req.ip || req.connection?.remoteAddress || '';
-      // Handle IPv6-mapped IPv4 (e.g. ::ffff:148.135.143.154)
+      // Handle IPv6-mapped IPv4 (e.g. ::ffff:72.61.225.127)
       const normalizedIp = clientIp.replace(/^::ffff:/, '');
       if (normalizedIp !== gatewayIp) {
         console.warn(`[Deposit] Webhook from unexpected IP: ${clientIp} (expected ${gatewayIp})`);
