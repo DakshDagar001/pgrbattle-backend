@@ -404,17 +404,20 @@ router.post('/zapupi-webhook', async (req, res) => {
 
     // ── Atomic Claim: Ensure only ONE request can process this specific deposit ──
     // Atomically transition status from PENDING to PROCESSING using RTDB transaction.
-    // If status is not PENDING (e.g. already PROCESSING, VERIFYING, SUCCESS, FAILED), the transaction aborts.
+    // In Firebase RTDB Node.js SDK, currentStatus is passed as null on initial local cache miss.
+    // We return 'PROCESSING' if currentStatus is null or 'PENDING' so Firebase queries the server.
+    // If the server confirms status was PENDING, the transaction commits.
+    // If status is already anything else (e.g. PROCESSING, VERIFYING, SUCCESS, FAILED), undefined is returned to abort.
     const statusRef = rtdb().ref(`depositOrders/${requestId}/status`);
     const claimTxResult = await statusRef.transaction((currentStatus) => {
-      if (currentStatus === 'PENDING') {
+      if (currentStatus === null || currentStatus === 'PENDING') {
         return 'PROCESSING';
       }
       return; // returning undefined aborts the transaction
     });
 
-    if (!claimTxResult.committed) {
-      console.log(`[Deposit] Webhook: deposit ${requestId} already claimed or processed (status was not PENDING) – ignoring duplicate`);
+    if (!claimTxResult.committed || claimTxResult.snapshot.val() !== 'PROCESSING') {
+      console.log(`[Deposit] Webhook: deposit ${requestId} already claimed or processed (status was ${claimTxResult.snapshot?.val()}) – ignoring duplicate`);
       return respondOk();
     }
 
@@ -558,6 +561,7 @@ router.post('/zapupi-webhook', async (req, res) => {
       processedBy: 'backend-auto',
       zapupiTxnId: orderStatus.txnId || webhookTxnId || null,
       zapupiUtr: orderStatus.utr || webhookUtr || null,
+      zapupiEnvironment: orderStatus.environment || payload.environment || null,
       utr: orderStatus.utr || webhookUtr || null // Also set legacy utr field for admin visibility
     };
 
