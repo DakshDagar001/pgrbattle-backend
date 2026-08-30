@@ -12,6 +12,9 @@ const cron = require("node-cron");
 
 const app = express();
 
+// Trust reverse proxy headers (e.g. Render, Cloudflare, load balancers)
+app.set('trust proxy', true);
+
 /* ===============================
    MIDDLEWARE
 ================================*/

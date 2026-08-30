@@ -334,17 +334,35 @@ router.post('/zapupi-webhook', async (req, res) => {
 
     console.log('[Deposit] ZapUPI webhook received:', JSON.stringify(payload));
 
-    // ── Optional IP whitelist ──
+    // ── Client IP Resolution (Proxy-aware for Render / CDNs) ──
+    const xForwardedFor = req.headers['x-forwarded-for'];
+    const forwardedIps = typeof xForwardedFor === 'string'
+      ? xForwardedFor.split(',').map(s => s.trim())
+      : [];
+    const rawClientIp = forwardedIps[0] ||
+                        req.headers['x-real-ip'] ||
+                        req.ip ||
+                        req.connection?.remoteAddress || '';
+    const normalizedIp = rawClientIp.replace(/^::ffff:/, '');
+
     const gatewayIp = process.env.ZAPUPI_GATEWAY_IP;
     if (gatewayIp) {
-      const clientIp = req.ip || req.connection?.remoteAddress || '';
-      // Handle IPv6-mapped IPv4 (e.g. ::ffff:72.61.225.127)
-      const normalizedIp = clientIp.replace(/^::ffff:/, '');
-      if (normalizedIp !== gatewayIp) {
-        console.warn(`[Deposit] Webhook from unexpected IP: ${clientIp} (expected ${gatewayIp})`);
-        // Still return 200 – don't leak info about validation
-        return respondOk();
+      const isLoopbackOrProxy = normalizedIp === '::1' ||
+                                normalizedIp === '127.0.0.1' ||
+                                normalizedIp.startsWith('10.') ||
+                                normalizedIp.startsWith('172.16.') ||
+                                normalizedIp.startsWith('192.168.');
+      const matchesGateway = normalizedIp === gatewayIp || forwardedIps.some(ip => ip.replace(/^::ffff:/, '') === gatewayIp);
+
+      if (matchesGateway) {
+        console.log(`[Deposit] Webhook origin verified against ZAPUPI_GATEWAY_IP: ${rawClientIp}`);
+      } else if (isLoopbackOrProxy) {
+        console.log(`[Deposit] Webhook received via internal proxy/loopback (${rawClientIp}) – proceeding with Order Status verification`);
+      } else {
+        console.warn(`[Deposit] Webhook from non-gateway IP: ${rawClientIp} (expected ${gatewayIp}) – proceeding with server-side Order Status verification`);
       }
+    } else {
+      console.log(`[Deposit] Webhook received from ${rawClientIp}`);
     }
 
     // ── Validate payload ──
