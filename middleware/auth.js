@@ -40,7 +40,8 @@ async function verifyAuth(req, res, next) {
 
     req.user = {
       uid: decodedToken.uid,
-      email: decodedToken.email || null
+      email: decodedToken.email || null,
+      phoneNumber: decodedToken.phone_number || null
     };
 
     next();
