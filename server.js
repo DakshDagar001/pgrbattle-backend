@@ -72,6 +72,7 @@ const depositRoutes = require('./routes/depositRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const emulatorRoutes = require('./routes/emulatorRoutes');
 const authRoutes = require('./routes/authRoutes');
+const adminAccountRoutes = require('./routes/adminAccountRoutes');
 const { initRoomTriggers, initTournamentNotificationTriggers } = require('./services/tournamentTriggers');
 
 // Gmail init — legacy, only attempt if env vars are present
@@ -101,6 +102,7 @@ try {
   app.use('/', notificationRoutes);
   app.use('/', emulatorRoutes);
   app.use('/api/auth', authRoutes);
+  app.use('/api/admin/account', adminAccountRoutes);
   console.log('✓ Express Routes loaded');
 } catch (err) {
   console.error('Route mounting failed:', err.message);

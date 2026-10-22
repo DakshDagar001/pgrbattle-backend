@@ -27,6 +27,17 @@ function createFakeFirestore(seed = {}) {
     stores.set(name, new Map(Object.entries(docs).map(([id, data]) => [id, structuredClone(data)])));
   }
 
+  // Injected infrastructure faults, so a test can make one document read or write
+  // fail exactly the way a dropped Firestore connection would.
+  const faults = new Set();
+  function checkFault(name, id, operation) {
+    const key = `${name}/${id}#${operation}`;
+    if (!faults.has(key)) return;
+    const error = new Error(`injected failure: ${operation} on ${key}`);
+    error.code = 14; // gRPC UNAVAILABLE
+    throw error;
+  }
+
   function store(name) {
     if (!stores.has(name)) stores.set(name, new Map());
     return stores.get(name);
@@ -34,18 +45,24 @@ function createFakeFirestore(seed = {}) {
 
   function reference(name, id) {
     return {
-      collection: name,
       id,
+      path: `${name}/${id}`,
+      // Subcollections are keyed by their full path, matching how a document
+      // reference exposes `.collection()` in the real SDK.
+      collection: sub => collection(`${name}/${id}/${sub}`),
       async get() {
+        checkFault(name, id, 'get');
         return snapshot(id, store(name).get(id));
       },
       async create(data) {
+        checkFault(name, id, 'create');
         const docs = store(name);
         if (docs.has(id)) throw alreadyExistsError(id);
         docs.set(id, structuredClone(data));
         return { writeTime: 'fake' };
       },
       async set(data, options = {}) {
+        checkFault(name, id, 'set');
         const docs = store(name);
         docs.set(id, options.merge
           ? { ...(docs.get(id) || {}), ...structuredClone(data) }
@@ -53,6 +70,7 @@ function createFakeFirestore(seed = {}) {
         return { writeTime: 'fake' };
       },
       async delete() {
+        checkFault(name, id, 'delete');
         store(name).delete(id);
         return { writeTime: 'fake' };
       }
@@ -63,6 +81,10 @@ function createFakeFirestore(seed = {}) {
     return {
       id: name,
       doc: id => reference(name, id),
+      async get() {
+        const docs = [...store(name).entries()].map(([id, data]) => snapshot(id, data));
+        return { empty: docs.length === 0, size: docs.length, docs };
+      },
       where(field, operator, value) {
         let limit = Infinity;
         const query = {
@@ -104,6 +126,12 @@ function createFakeFirestore(seed = {}) {
   return {
     collection,
     runTransaction,
+    __fail(name, id, operation) {
+      faults.add(`${name}/${id}#${operation}`);
+    },
+    __heal(name, id, operation) {
+      faults.delete(`${name}/${id}#${operation}`);
+    },
     __seed(name, id, data) {
       store(name).set(id, structuredClone(data));
     },
