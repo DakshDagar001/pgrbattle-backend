@@ -47,6 +47,7 @@ function createFakeFirestore(seed = {}) {
     return {
       id,
       path: `${name}/${id}`,
+      __store: name,
       // Subcollections are keyed by their full path, matching how a document
       // reference exposes `.collection()` in the real SDK.
       collection: sub => collection(`${name}/${id}/${sub}`),
@@ -115,11 +116,33 @@ function createFakeFirestore(seed = {}) {
       set(ref, data, options) {
         writes.push({ ref, data, options });
         return null;
+      },
+      delete(ref) {
+        writes.push({ ref, remove: true });
+        return null;
       }
     };
 
     const result = await work(transaction);
-    for (const write of writes) await write.ref.set(write.data, write.options);
+    // A real commit is all-or-nothing: if applying one write fails, nothing lands.
+    // Each write is therefore undoable, so an injected fault leaves every document
+    // exactly as it was before the transaction ran.
+    const applied = [];
+    try {
+      for (const write of writes) {
+        const docs = store(write.ref.__store);
+        applied.push({ store: write.ref.__store, id: write.ref.id, before: docs.get(write.ref.id) });
+        if (write.remove) await write.ref.delete();
+        else await write.ref.set(write.data, write.options);
+      }
+    } catch (error) {
+      for (const entry of applied.reverse()) {
+        const docs = store(entry.store);
+        if (entry.before === undefined) docs.delete(entry.id);
+        else docs.set(entry.id, structuredClone(entry.before));
+      }
+      throw error;
+    }
     return result;
   }
 

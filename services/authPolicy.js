@@ -33,6 +33,30 @@ function regionForPhone(phoneNumber) {
 }
 
 /**
+ * The strict canonical form of a supported number: '+' calling code plus exactly
+ * `nationalLength` national digits. Used wherever a number is about to be written,
+ * so a half-entered or badly prefixed value can never become the stored truth. The
+ * caller keeps ownership of anything it wants to reject, because null is also the
+ * answer for a number from a country this app does not serve.
+ */
+function canonicalPhoneNumber(raw) {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  const assignment = regionForPhone(value);
+  if (!assignment) return null;
+  const region = SUPPORTED_REGIONS.find(item => item.callingCode === assignment.callingCode);
+  const national = value.slice(region.callingCode.length);
+  if (!/^[0-9]+$/.test(national) || national.length !== region.nationalLength) return null;
+  if (national.startsWith('0')) return null;
+  return {
+    phoneNumber: `${region.callingCode}${national}`,
+    callingCode: region.callingCode,
+    national,
+    region: region.code,
+    name: region.name
+  };
+}
+
+/**
  * Usernames are stored and compared case-insensitively. The normalized value
  * doubles as the `usernames/{docId}` key, so it must also be document-id safe.
  */
@@ -65,6 +89,7 @@ function regionByCallingCode(callingCode) {
 module.exports = {
   SUPPORTED_REGIONS,
   REGION_BY_CALLING_CODE,
+  canonicalPhoneNumber,
   normalizeUsername,
   isValidUsername,
   regionForPhone,
