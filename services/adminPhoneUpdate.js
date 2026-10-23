@@ -102,10 +102,22 @@ function createAdminPhoneUpdateService({ db, auth, isAdminUid, serverTimestamp }
   /**
    * Profile and registry move together or not at all. The old registry mapping is
    * only removed when it demonstrably belonged to this account.
+   *
+   * Firestore rejects a transaction that reads after it has already written
+   * ("transactions require all reads to be executed before all writes"), so both
+   * reservations are read up front and every decision is taken from those snapshots
+   * before the first write is queued.
    */
   async function commitWrites({ targetUid, candidate, previous, region, actorUid }) {
     await db.runTransaction(async transaction => {
-      const entry = await transaction.get(registry().doc(candidate));
+      const swapping = previous && previous !== candidate;
+      const [entry, oldEntry] = await Promise.all([
+        transaction.get(registry().doc(candidate)),
+        // A legacy profile can hold a number that was never a registry key. Reading
+        // it is still the honest answer: if no such document exists, nothing is freed.
+        swapping ? transaction.get(registry().doc(previous)) : Promise.resolve(null)
+      ]);
+
       const owner = entry.exists ? (entry.data() || {}).uid : '';
       if (owner && owner !== targetUid) {
         const error = new Error('PHONE_TAKEN');
@@ -113,18 +125,17 @@ function createAdminPhoneUpdateService({ db, auth, isAdminUid, serverTimestamp }
         throw error;
       }
 
+      const oldOwner = oldEntry && oldEntry.exists ? (oldEntry.data() || {}).uid : '';
+
       // The profile keeps every other field exactly as it is: a merge write of the
-      // three phone fields, never a document rewrite.
+      // two fields this operation owns, never a document rewrite.
       transaction.set(users().doc(targetUid), {
         phone: candidate,
         phoneVerified: false
       }, { merge: true });
 
-      if (previous && previous !== candidate) {
-        const oldEntry = await transaction.get(registry().doc(previous));
-        if (oldEntry.exists && (oldEntry.data() || {}).uid === targetUid) {
-          transaction.delete(registry().doc(previous));
-        }
+      if (oldOwner === targetUid) {
+        transaction.delete(registry().doc(previous));
       }
 
       transaction.set(registry().doc(candidate), {

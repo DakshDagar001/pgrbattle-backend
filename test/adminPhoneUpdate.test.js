@@ -618,3 +618,122 @@ test('a profile with no phone at all can be given one', async () => {
 test('the service refuses to be built without its authoritative dependencies', () => {
   assert.throws(() => createAdminPhoneUpdateService({ db: {}, auth: {} }), /requires/);
 });
+
+// ==========================================================================
+// The production shape: a legacy national-only number being canonicalised
+//
+// These three cases are the exact account shape that shipped a partial update:
+// the profile holds ten digits with no calling code, the sign-in has already been
+// moved, and the profile write is followed by a read of the old reservation. Every
+// one of them swaps the old number for a new one, so the transaction has to read
+// both reservations before it writes anything.
+// ==========================================================================
+
+const LEGACY_NATIONAL = '7906123463';
+const LEGACY_CANONICAL = '+917906123463';
+
+/** A player whose number was never canonical: no calling code, no reservation. */
+function legacySeededState({ authPhoneNumber = LEGACY_NATIONAL } = {}) {
+  const firestore = createFakeFirestore({
+    users: {
+      'uid-4': {
+        username: 'legacyplayer',
+        email: 'legacy@example.com',
+        phone: LEGACY_NATIONAL,
+        depositBalance: 50,
+        wonBalance: 10
+      }
+    },
+    phoneNumbers: {},
+    admin_users: { 'admin-1': { uid: 'admin-1' } }
+  });
+  const auth = createFakeAuth({
+    accounts: new Map([['uid-4', { phoneNumber: authPhoneNumber }]])
+  });
+  return { firestore, auth };
+}
+
+test('a legacy national-only number becomes canonical in one pass', async () => {
+  const { firestore, auth } = legacySeededState();
+  const app = await withRoute(firestore, auth);
+  try {
+    const response = await app.post(
+      { uid: 'uid-4', phoneNumber: LEGACY_CANONICAL }, 'token-admin'
+    );
+    assert.equal(response.status, 200, 'the profile write must not be lost');
+    assert.equal(response.body.code, 'COMPLETE');
+
+    assert.equal(firestore.__peek('users', 'uid-4').phone, LEGACY_CANONICAL);
+    assert.equal(firestore.__peek('users', 'uid-4').phoneVerified, false,
+      'an administrative change is never marked as verified');
+    assert.equal(firestore.__peek('phoneNumbers', LEGACY_CANONICAL).uid, 'uid-4');
+    assert.equal(firestore.__peek('phoneNumbers', LEGACY_CANONICAL).source, ADMIN_SOURCE);
+    assert.equal(firestore.__peek('phoneNumbers', LEGACY_NATIONAL), undefined,
+      'the legacy digits were never a registry key');
+    assert.deepEqual(auth.calls.updateUser, [['uid-4', { phoneNumber: LEGACY_CANONICAL }]]);
+  } finally {
+    await app.close();
+  }
+});
+
+test('the retry after that partial failure finishes the change without touching the sign-in again', async () => {
+  // The state a failed attempt actually leaves behind: the sign-in already holds
+  // the canonical number, the profile still holds the legacy digits.
+  const { firestore, auth } = legacySeededState({ authPhoneNumber: LEGACY_CANONICAL });
+  const app = await withRoute(firestore, auth);
+  try {
+    const response = await app.post(
+      { uid: 'uid-4', phoneNumber: LEGACY_CANONICAL }, 'token-admin'
+    );
+    assert.equal(response.status, 200);
+    assert.equal(response.body.code, 'COMPLETE');
+    assert.deepEqual(auth.calls.updateUser, [],
+      'the sign-in already holds the number, so it must not be written a second time');
+    assert.equal(firestore.__peek('users', 'uid-4').phone, LEGACY_CANONICAL);
+    assert.equal(firestore.__peek('phoneNumbers', LEGACY_CANONICAL).uid, 'uid-4');
+  } finally {
+    await app.close();
+  }
+});
+
+test('a legacy correction leaves the stored server and balances alone', async () => {
+  const { firestore, auth } = legacySeededState();
+  firestore.__seed('users', 'uid-4', {
+    username: 'legacyplayer',
+    phone: LEGACY_NATIONAL,
+    phoneRegion: 'IN',
+    depositBalance: 50,
+    joinedTournaments: { 't-1': true }
+  });
+  const app = await withRoute(firestore, auth);
+  try {
+    const response = await app.post(
+      { uid: 'uid-4', phoneNumber: LEGACY_CANONICAL }, 'token-admin'
+    );
+    assert.equal(response.status, 200);
+    const after = firestore.__peek('users', 'uid-4');
+    assert.equal(after.phoneRegion, 'IN', 'editing the number never edits the server');
+    assert.equal(after.depositBalance, 50);
+    assert.deepEqual(after.joinedTournaments, { 't-1': true });
+  } finally {
+    await app.close();
+  }
+});
+
+// ==========================================================================
+// Transaction ordering, which Firestore enforces and this double must too
+// ==========================================================================
+
+test('the Firestore double rejects a read that follows a write', async () => {
+  const firestore = createFakeFirestore({ users: { 'uid-1': { phone: OLD } } });
+  await assert.rejects(
+    firestore.runTransaction(async transaction => {
+      transaction.set(firestore.collection('users').doc('uid-1'), { phone: NEW }, { merge: true });
+      await transaction.get(firestore.collection('phoneNumbers').doc(OLD));
+    }),
+    /all reads to be executed before all writes/,
+    'an ordering mistake must fail loudly here, as it does in production'
+  );
+  assert.equal(firestore.__peek('users', 'uid-1').phone, OLD,
+    'a rejected transaction applies nothing');
+});

@@ -109,8 +109,21 @@ function createFakeFirestore(seed = {}) {
 
   async function runTransaction(work) {
     const writes = [];
+    // The real Firestore backend rejects a transaction that reads after it has
+    // already written. Doubling that rule here is what makes an ordering mistake in
+    // service code fail a test instead of only failing in production, where the
+    // whole transaction is lost and the caller is told the change was partial.
+    function assertReadsFirst() {
+      if (writes.length === 0) return;
+      const error = new Error(
+        'Firestore transactions require all reads to be executed before all writes.'
+      );
+      error.code = 3; // gRPC INVALID_ARGUMENT
+      throw error;
+    }
     const transaction = {
       async get(ref) {
+        assertReadsFirst();
         return ref.get();
       },
       set(ref, data, options) {
