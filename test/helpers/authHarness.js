@@ -55,8 +55,14 @@ async function startServer(app) {
   };
 }
 
-async function request(baseUrl, path, { method = 'GET', token, body } = {}) {
-  const headers = {};
+/**
+ * `headers` carries the caller's own declarations - a device identifier, for the organizer routes -
+ * which the routes read from the request rather than from a body. Authorization and Content-Type
+ * are set by this helper and are set last, so a test cannot accidentally replace the identity it
+ * is meant to be asserting.
+ */
+async function request(baseUrl, path, { method = 'GET', token, body, headers: extra } = {}) {
+  const headers = { ...(extra || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
 

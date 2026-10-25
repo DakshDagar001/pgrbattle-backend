@@ -151,7 +151,56 @@ function initTournamentNotificationTriggers() {
   });
 }
 
+// The completion milestone as the reward service reads it, tracked per match so only the
+// false -> true transition is acted on.
+const knownPrizesDistributed = new Map();
+
+/**
+ * Pays the organizer reward when a match's results are finalised.
+ *
+ * `prizesDistributed` is written by the results transaction in both apps' results screen, in the
+ * same transaction that pays the players, so it is the one signal that means "finished and
+ * settled" rather than "a status string changed". The listener acts on the transition only: an
+ * initial snapshot seeds the map without paying, which is what keeps a restart from mass-crediting
+ * every match completed before it. Everything the listener misses is picked up by the bounded
+ * catch-up pass the cron runs, and both paths share the ledger key, so neither can pay twice.
+ */
+function initOrganizerRewardTriggers(rewards) {
+  if (!rewards) return;
+  const db = admin.firestore();
+
+  db.collection('tournaments').onSnapshot(snapshot => {
+    snapshot.docChanges().forEach(async change => {
+      const tournamentId = change.doc.id;
+      const data = change.doc.data() || {};
+      const distributed = data.prizesDistributed === true;
+      const previous = knownPrizesDistributed.get(tournamentId);
+      knownPrizesDistributed.set(tournamentId, distributed);
+
+      // A deleted match is forgotten rather than paid, and an initial `added` is only seeded.
+      if (change.type === 'removed') {
+        knownPrizesDistributed.delete(tournamentId);
+        return;
+      }
+      if (change.type === 'added') return;
+      if (!distributed || previous === true) return;
+
+      try {
+        const result = await rewards.grantForTournament({ tournamentId });
+        if (result.code !== 'NOT_COMPLETED') {
+          console.log('[Triggers] Reward for', tournamentId, '->', result.code,
+            result.organizerUid || '', result.amount || '');
+        }
+      } catch (error) {
+        // The catch-up pass will reach the same match, and the ledger key keeps that safe.
+        console.error('[Triggers] Reward for', tournamentId, 'failed:', error.message);
+      }
+    });
+  });
+}
+
 module.exports = {
   initRoomTriggers,
-  initTournamentNotificationTriggers
+  initTournamentNotificationTriggers,
+  initOrganizerRewardTriggers
 };

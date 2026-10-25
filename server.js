@@ -63,6 +63,19 @@ try {
 const db = admin.firestore();
 const rtdb = admin.database();
 
+// Mode browsing remains available to authenticated players, but the legacy mode password field
+// must not remain readable in old documents. Cleanup is idempotent and runs before routes start.
+removeLegacyModePasswords({ db, admin })
+  .then(result => {
+    if (result.cleaned > 0) {
+      console.log('[TournamentModes] Removed legacy plaintext passwords:', result.cleaned);
+    }
+  })
+  .catch(error => {
+    // Do not silently claim cleanup succeeded; deployment operators need to see a failed scrub.
+    console.error('[TournamentModes] Legacy password cleanup failed:', error.message);
+  });
+
 /* ===============================
    DEPOSIT SYSTEM INIT
 ================================*/
@@ -73,7 +86,22 @@ const notificationRoutes = require('./routes/notificationRoutes');
 const emulatorRoutes = require('./routes/emulatorRoutes');
 const authRoutes = require('./routes/authRoutes');
 const adminAccountRoutes = require('./routes/adminAccountRoutes');
-const { initRoomTriggers, initTournamentNotificationTriggers } = require('./services/tournamentTriggers');
+const { createOrganizerEconomyService } = require('./services/organizerEconomy');
+const { createOrganizerRewardService } = require('./services/organizerRewards');
+const { createPenaltyEnforcementService } = require('./services/organizerPenalties');
+const { createTournamentReminders } = require('./services/tournamentReminders');
+const { createOrganizerDeviceService } = require('./services/organizerDevices');
+const { createAuditTrail } = require('./services/auditTrail');
+// Mounted below through their factories, because the organizer routes share one audit trail and
+// one device service with each other.
+const { createOrganizerDeviceRouter } = require('./routes/organizerDeviceRoutes');
+const { createOrganizerWalletRouter } = require('./routes/organizerWalletRoutes');
+const { createOrganizerTournamentRouter } = require('./routes/organizerTournamentRoutes');
+const { createOrganizerOpsRouter } = require('./routes/organizerOpsRoutes');
+const { createPlayerTournamentRouter } = require('./routes/playerTournamentRoutes');
+const { createAdminOrganizerRouter } = require('./routes/organizerAdminRoutes');
+const { initRoomTriggers, initTournamentNotificationTriggers, initOrganizerRewardTriggers } = require('./services/tournamentTriggers');
+const { removeLegacyModePasswords } = require('./services/tournamentModePasswordCleanup');
 
 // Gmail init — legacy, only attempt if env vars are present
 if (process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN) {
@@ -96,21 +124,105 @@ try {
   console.error('Deposit Verifier init failed:', err.message);
 }
 
-// Mount routes
+/* ===============================
+   ORGANIZER AUDIT TRAIL AND DEVICE BINDING
+
+   Two shared instances for the same reason the economy service has one: neither holds state
+   beyond the database handle and the server clock, and a privileged act that is recorded through
+   one trail and a binding that is read through one service is the whole point of both features.
+   `transcripts` is the schema every administrative act in this project has always used - this
+   adds sections to it, not a parallel log - and the device records are written only here, which
+   is what lets the rules deny every client write to them.
+================================*/
+const organizerAudit = createAuditTrail({
+  db,
+  serverTimestamp: () => admin.firestore.FieldValue.serverTimestamp()
+});
+
+const organizerDevices = createOrganizerDeviceService({
+  db,
+  serverTimestamp: () => admin.firestore.FieldValue.serverTimestamp(),
+  audit: organizerAudit
+});
+
 try {
+  // Mount routes
   app.use('/api/deposit', depositRoutes);
   app.use('/', notificationRoutes);
   app.use('/', emulatorRoutes);
   app.use('/api/auth', authRoutes);
   app.use('/api/admin/account', adminAccountRoutes);
+  app.use('/api/organizer/wallet', createOrganizerWalletRouter({
+    devices: organizerDevices, audit: organizerAudit
+  }));
+  // Creating a match is the one tournament write that cannot be a direct client write: the daily
+  // allowance has to be counted atomically and the device has to be the approved one.
+  app.use('/api/organizer/tournaments', createOrganizerTournamentRouter({
+    devices: organizerDevices, audit: organizerAudit
+  }));
+  app.use('/api/organizer/devices', createOrganizerDeviceRouter({
+    devices: organizerDevices, audit: organizerAudit
+  }));
+  // The trusted decision behind every protected organizer edit, cancellation, result and prize
+  // issue: the answer is a permit `firestore.rules` requires before it accepts the write.
+  app.use('/api/organizer/ops', createOrganizerOpsRouter({ devices: organizerDevices }));
+  // The Player app's one server-side question: does this password open this match?
+  app.use('/api/player/tournament', createPlayerTournamentRouter());
+  app.use('/api/admin/organizer', createAdminOrganizerRouter({
+    devices: organizerDevices, audit: organizerAudit
+  }));
+  console.log('✓ Organizer routes', [
+    '/api/organizer/wallet', '/api/organizer/tournaments', '/api/organizer/devices',
+    '/api/organizer/ops', '/api/player/tournament', '/api/admin/organizer'
+  ].join(' '));
   console.log('✓ Express Routes loaded');
 } catch (err) {
   console.error('Route mounting failed:', err.message);
 }
 
+// The organizer economy's only balance writer. One instance for the schedules below: it holds
+// no state, only the database handle and the server clock, so sharing it costs nothing and
+// keeps every movement inside the same transaction rules.
+const organizerEconomy = createOrganizerEconomyService({
+  db,
+  serverTimestamp: () => admin.firestore.FieldValue.serverTimestamp()
+});
+
 // Initialize triggers
 initRoomTriggers();
 initTournamentNotificationTriggers();
+
+/* ===============================
+   ORGANIZER COMPLETION REWARDS
+
+   The listener pays on the `prizesDistributed` transition, which the results transaction writes
+   together with the player payouts. The bounded catch-up below covers what a restart can miss;
+   both paths use one ledger key per match, so neither can pay the same match twice.
+================================*/
+const organizerRewards = createOrganizerRewardService({
+  db,
+  economy: organizerEconomy,
+  audit: organizerAudit
+});
+
+try {
+  initOrganizerRewardTriggers(organizerRewards);
+} catch (err) {
+  // A listener that cannot start does not stop the rewards the catch-up pass will find.
+  console.error('[OrganizerRewards] Listener failed to start:', err.message);
+}
+
+async function checkOrganizerRewards() {
+  try {
+    const result = await organizerRewards.catchUp({ sinceHours: 168, limit: 300 });
+    // Only a pass that actually paid or found something worth reporting gets a log line.
+    if (result.summary.credited || result.summary.duplicate || result.summary.failed) {
+      console.log('[OrganizerRewards] Catch-up', JSON.stringify(result.summary));
+    }
+  } catch (err) {
+    console.error('[OrganizerRewards] Catch-up failed:', err.message);
+  }
+}
 
 // Render owns this listener. Status changes are written by the admin app; the
 // listener sends exactly once through the same template-aware FCM engine.
@@ -172,42 +284,63 @@ app.get("/", (_, res) => {
 
 /* ===============================
    TOURNAMENT REMINDERS
+
+   Fixed in Phase 10: this job used to query `tournaments.startTime`, a field no client in this
+   project writes, so it could never match a match. It now reads `dateTime` - the field the
+   Organizer compose screen writes and the Player app reads - and does its work in
+   `services/tournamentReminders.js`, where the window, the exclusions, the milestone choice and
+   the duplicate-notification guard can be tested without a scheduler.
 ================================*/
+const tournamentReminders = createTournamentReminders({
+  db,
+  notify: notifyByEvent
+});
+
 async function checkTournamentReminders() {
-  const now = new Date();
-  const offsets = [60, 30, 5];
-
-  for (const offset of offsets) {
-    const future = new Date(now.getTime() + offset * 60000);
-
-    const snap = await db.collection("tournaments")
-      .where("startTime", ">=", now)
-      .where("startTime", "<=", future)
-      .get();
-
-    for (const doc of snap.docs) {
-      const data = doc.data();
-
-      if (data.reminderSent?.includes(offset)) continue;
-
-      await notifyByEvent(
-        'tournament_reminder',
-        'tournament',
-        doc.id,
-        {
-          TOURNAMENT_NAME: data.name || 'Tournament',
-          MINUTES: offset,
-          DATE: data.startTime?.toDate?.().toLocaleDateString() || '',
-          TIME: data.startTime?.toDate?.().toLocaleTimeString() || '',
-          deepLink: `pgr://tournament/${doc.id}`
-        },
-        { title: 'Tournament Reminder', body: '{{TOURNAMENT_NAME}} starts in {{MINUTES}} minutes' }
-      );
-
-      await db.collection("tournaments").doc(doc.id).update({
-        reminderSent: admin.firestore.FieldValue.arrayUnion(offset)
-      });
+  try {
+    const result = await tournamentReminders.runOnce();
+    // A pass with nothing due is the normal case and is not worth a log line every five minutes.
+    if (result.summary.sent > 0 || result.summary.failed > 0) {
+      console.log('[TournamentReminders] Pass', result.code, JSON.stringify(result.summary));
     }
+  } catch (err) {
+    // Operational, not financial: a failed pass leaves every match for the next one.
+    console.error('[TournamentReminders] Pass failed:', err.message);
+  }
+}
+
+/* ===============================
+   ORGANIZER DEADLINE PENALTIES
+
+   A recurring check rather than an event, because the violation is "nothing happened by the
+   deadline": there is no write to listen for. The charge itself is the economy service's
+   `deductPenalty`, whose ledger key is derived from the match, so this job is free to run
+   twice, restart mid-pass or exist on more than one replica.
+
+   It reads `dateTime`, which is the field the Organizer and Admin compose screens actually
+   write as the scheduled start - and now so does the reminder job above, which used to query
+   `startTime` and therefore never matched a match.
+================================*/
+const penaltyEnforcement = createPenaltyEnforcementService({
+  db,
+  economy: organizerEconomy,
+  serverTimestamp: () => admin.firestore.FieldValue.serverTimestamp(),
+  ...(Number(process.env.ORGANIZER_PENALTY_LOOKBACK_HOURS) > 0
+    ? { lookbackHours: Number(process.env.ORGANIZER_PENALTY_LOOKBACK_HOURS) }
+    : {})
+});
+
+async function checkOrganizerDeadlines() {
+  try {
+    const result = await penaltyEnforcement.sweepOnce();
+    // A sweep that is switched off is the normal state and not worth a log line every ten
+    // minutes; anything that actually looked at matches is reported with its counts.
+    if (result.code !== 'DISABLED') {
+      console.log('[OrganizerPenalties] Sweep', result.code, JSON.stringify(result.summary || {}));
+    }
+  } catch (err) {
+    // Operational, not financial: a failed pass leaves every match for the next one.
+    console.error('[OrganizerPenalties] Sweep failed:', err.message);
   }
 }
 
@@ -219,6 +352,12 @@ async function startServer() {
   // Schedules are now initialized in notificationRoutes.js
 
   cron.schedule("*/5 * * * *", checkTournamentReminders);
+  // The deadline sweep and the reward catch-up share one ten-minute schedule: both are bounded,
+  // both are idempotent, and neither needs a scheduler of its own.
+  cron.schedule("*/10 * * * *", async () => {
+    await checkOrganizerDeadlines();
+    await checkOrganizerRewards();
+  });
 
   const PORT = process.env.PORT || 8080;
 
