@@ -7,6 +7,7 @@ validateEnv();
 const express = require("express");
 const axios = require("axios");
 const admin = require("firebase-admin");
+const { removeLegacyModePasswords } = require('./services/tournamentModePasswordCleanup');
 const cors = require("cors");
 const cron = require("node-cron");
 
@@ -101,7 +102,6 @@ const { createOrganizerOpsRouter } = require('./routes/organizerOpsRoutes');
 const { createPlayerTournamentRouter } = require('./routes/playerTournamentRoutes');
 const { createAdminOrganizerRouter } = require('./routes/organizerAdminRoutes');
 const { initRoomTriggers, initTournamentNotificationTriggers, initOrganizerRewardTriggers } = require('./services/tournamentTriggers');
-const { removeLegacyModePasswords } = require('./services/tournamentModePasswordCleanup');
 
 // Gmail init — legacy, only attempt if env vars are present
 if (process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET && process.env.GMAIL_REFRESH_TOKEN) {
